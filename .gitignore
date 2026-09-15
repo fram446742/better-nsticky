@@ -1,6 +1,13 @@
 # Rust
 /target
 
+# Arch packaging output
+/packaging/*.pkg.tar.zst
+/packaging/*.pkg.tar.xz
+/packaging/*.tar.gz
+/packaging/src/
+/packaging/pkg/
+
 # Nix
 .direnv/
 .envrc

@@ -1,19 +1,36 @@
 [package]
-name = "nsticky"
-version = "0.4.0"
+
+name = "better-nsticky"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Sticky and staged window management for the niri Wayland compositor (better-nsticky fork)"
+license = "BSD-3-Clause"
+repository = "https://github.com/fram446742/better-nsticky"
+homepage = "https://github.com/fram446742/better-nsticky"
+readme = "README.md"
+keywords = ["niri", "wayland", "sticky", "window-manager"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "nsticky"
+path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-toml = "0.8"
-regex = "1"
-dirs = "5"
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+toml = "1.1"
+regex = "1.13"
+shell-words = "1.1"
+dirs = "7.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+parking_lot = "0.12"
 
 [profile.release]
 strip = true

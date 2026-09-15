@@ -1,5 +1,5 @@
 {
-  description = "A sticky windows manager CLI tool for Niri";
+  description = "Sticky windows for Niri (better-nsticky, drop-in nsticky binary)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -62,6 +62,8 @@
               clippy
               cargo-watch
               cargo-criterion
+              # Used by scripts/e2e-smoke.sh (fake niri IPC server).
+              python3
             ];
           };
         };

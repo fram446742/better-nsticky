@@ -13,8 +13,8 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   meta = {
-    description = "A sticky windows manager CLI tool for Niri";
-    homepage = "https://github.com/lonerOrz/nsticky";
+    description = "Sticky and staged window management for the niri compositor (better-nsticky)";
+    homepage = "https://github.com/fram446742/better-nsticky";
     mainProgram = "nsticky";
     license = lib.licenses.bsd3;
     maintainers = with lib.maintainers; [ lonerOrz ];

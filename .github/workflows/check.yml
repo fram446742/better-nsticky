@@ -40,5 +40,40 @@ jobs:
       - name: Cargo fmt
         run: nix develop -c cargo fmt -- --check
 
+      - name: Cargo clippy
+        run: nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Cargo test
         run: nix develop -c cargo test --all-features
+
+      # The suite is quick and mostly about timing and temporary sockets, where
+      # a single green run proves little: three test bugs in this repository
+      # only showed up once the whole suite was repeated under load.
+      - name: Cargo test (twenty times)
+        run: nix develop -c sh -c 'for i in $(seq 1 20); do cargo test --all-features -q || exit 1; done'
+
+      - name: Cargo build
+        run: nix develop -c cargo build --locked
+
+      - name: Cargo doc
+        run: nix develop -c cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: End-to-end smoke test
+        run: nix develop -c scripts/e2e-smoke.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+    name: minimum supported Rust
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      # `rust-version` in Cargo.toml, so the README's claim is actually checked.
+      - name: Cargo check
+        run: cargo check --all-targets --locked
