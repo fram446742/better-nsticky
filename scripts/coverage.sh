@@ -4,16 +4,21 @@
 #   scripts/coverage.sh                    # summary only
 #   LCOV_PATH=lcov.info scripts/coverage.sh # also write an lcov file (CI uploads it)
 #   HTML_DIR=target/cov-html ...           # also write an HTML report
-#   MIN_LINES=90 ...                       # fail when line coverage drops below 90%
+#   MIN_LINES=98 ...                       # fail when line coverage drops below 98%
 #
 # python3 is required: the end-to-end pass runs the instrumented binary against
 # the fake compositor, which is what covers main.rs and the daemon's real socket.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Some dev profiles pick the cranelift backend, which cannot instrument code.
-export CARGO_PROFILE_DEV_CODEGEN_BACKEND="${CARGO_PROFILE_DEV_CODEGEN_BACKEND:-llvm}"
-export CARGO_PROFILE_TEST_CODEGEN_BACKEND="${CARGO_PROFILE_TEST_CODEGEN_BACKEND:-llvm}"
+# A dev profile that selects the cranelift backend cannot be instrumented, so
+# force LLVM for this build. The profile key behind that is nightly-only: on a
+# stable toolchain cargo refuses it outright ("feature `codegen-backend` is
+# required"), and a stable toolchain cannot be using cranelift anyway.
+if [[ "$(rustc -vV 2>/dev/null)" == *nightly* ]]; then
+  export CARGO_PROFILE_DEV_CODEGEN_BACKEND="${CARGO_PROFILE_DEV_CODEGEN_BACKEND:-llvm}"
+  export CARGO_PROFILE_TEST_CODEGEN_BACKEND="${CARGO_PROFILE_TEST_CODEGEN_BACKEND:-llvm}"
+fi
 
 eval "$(cargo llvm-cov show-env --sh)"
 cargo llvm-cov clean --workspace
