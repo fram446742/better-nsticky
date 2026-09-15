@@ -21,7 +21,12 @@ if [[ "$(rustc -vV 2>/dev/null)" == *nightly* ]]; then
 fi
 
 eval "$(cargo llvm-cov show-env --sh)"
-cargo llvm-cov clean --workspace
+
+# Drop only this run's profile data. `cargo llvm-cov clean` would clean the whole
+# target directory, throwing away the release build and every cached artifact
+# with it.
+COV_DIR="${CARGO_LLVM_COV_TARGET_DIR:-target}"
+rm -f "$COV_DIR"/*.profraw "$COV_DIR"/nsticky-profraw-list "$COV_DIR"/nsticky.profdata
 
 cargo test --all-features >/dev/null
 cargo build --all-features >/dev/null
