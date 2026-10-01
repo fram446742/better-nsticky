@@ -80,10 +80,15 @@ packaging/make-pkg.sh -si      # build and install it (sudo)
 ```
 
 The package is named `better-nsticky`, `provides`/`conflicts` with `nsticky`, and
-installs `/usr/bin/nsticky`. It depends on `cargo` for building only. Once the
-repository is pushed and tagged, the same PKGBUILD works for the AUR — swap the
-`source` line for the tagged tarball as the comment in the file explains, then
-run `updpkgsums`.
+installs `/usr/bin/nsticky`. The PKGBUILD fetches the versioned GitHub source
+archive and verifies its SHA-256 checksum. After publishing the recipe to the
+AUR, install it with `paru -S better-nsticky` or an equivalent AUR helper.
+
+To publish or update it, copy `packaging/PKGBUILD` and `packaging/LICENSE` into
+the separate AUR Git checkout. Generate `.SRCINFO` with
+`makepkg --printsrcinfo > .SRCINFO`, then commit and push all three files.
+The AUR stores only the recipe and metadata; the source archive stays on GitHub.
+An AUR account with a registered SSH key is required for Git pushes.
 
 ### Nix
 

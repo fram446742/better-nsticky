@@ -1,23 +1,15 @@
 # Maintainer: Francisco Martín Vélez Manrique <francisco446742@gmail.com>
 #
-# Builds the better-nsticky package. The installed binary is `nsticky`, and the
-# package provides/conflicts with `nsticky` so it can replace it (same command,
-# config path, socket and systemd unit).
+# Builds a pinned GitHub release archive for the AUR.
 #
-# Local build (no GitHub needed):
-#     packaging/make-pkg.sh            # creates the source tarball and runs makepkg
-#     packaging/make-pkg.sh -si        # ... and installs it (asks for sudo)
-#
-# Once the repository is pushed and tagged, the same PKGBUILD works for the AUR:
-# replace the `source` line below with
-#     source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# and fill in the checksum (`updpkgsums`).
+# The installed binary remains `nsticky`, so this package replaces upstream
+# nsticky without changing its command, configuration, socket or systemd unit.
 
 pkgname=better-nsticky
 pkgver=0.5.0
 pkgrel=1
 pkgdesc="Sticky and staged window management for the niri Wayland compositor (drop-in nsticky)"
-arch=('x86_64' 'aarch64')
+arch=('x86_64')
 url="https://github.com/fram446742/better-nsticky"
 license=('BSD-3-Clause')
 depends=('glibc')
@@ -26,8 +18,8 @@ makedepends=('cargo')
 provides=('nsticky')
 conflicts=('nsticky')
 options=('!lto') # the release profile already enables LTO
-source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/fram446742/better-nsticky/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('0eec1defd9ba2d4c82ea6195e7fddcf9bb8b7f70a3038e878cd2c7f6959b3693')
 
 build() {
   cd "$pkgname-$pkgver"
