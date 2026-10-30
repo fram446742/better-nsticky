@@ -101,6 +101,7 @@ impl FakeNiri {
                 title: Some((*title).to_string()),
                 workspace_id: None,
                 floating: false,
+                is_urgent: false,
                 size: None,
                 position: None,
             })
@@ -167,6 +168,7 @@ impl FakeNiri {
                 title: Some((*title).to_string()),
                 workspace_id: None,
                 floating: false,
+                is_urgent: false,
                 size: None,
                 position: None,
             })

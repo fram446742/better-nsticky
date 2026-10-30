@@ -317,6 +317,7 @@ fn parse_windows(payload: &Value) -> Result<Vec<WindowInfo>> {
                 title: item.get("title").and_then(|v| v.as_str()).map(String::from),
                 workspace_id: item.get("workspace_id").and_then(|v| v.as_u64()),
                 floating: item.get("is_floating").and_then(|v| v.as_bool()) == Some(true),
+                is_urgent: item.get("is_urgent").and_then(|v| v.as_bool()) == Some(true),
                 size: window_size(item),
                 position: window_position(item),
             })
@@ -714,6 +715,7 @@ mod tests {
                 title: Some("Inbox".to_string()),
                 workspace_id: Some(10),
                 floating: false,
+                is_urgent: false,
                 size: None,
                 position: None,
             }
@@ -725,13 +727,14 @@ mod tests {
     #[test]
     fn test_parse_windows_reads_geometry() {
         let payload = json!({"Windows": [
-            {"id": 4, "app_id": "foot", "is_floating": true,
+            {"id": 4, "app_id": "foot", "is_floating": true, "is_urgent": true,
              "layout": {"window_size": [1100.0, 480.0], "tile_pos_in_workspace_view": [730.0, 94.0]}},
         ]});
 
         let windows = parse_windows(&payload).unwrap();
         assert_eq!(windows[0].size, Some((1100, 480)));
         assert_eq!(windows[0].position, Some((730.0, 94.0)));
+        assert!(windows[0].is_urgent, "urgency is parsed for restore sort");
     }
 
     /// A window whose geometry cannot be read must end up with `None`, and a

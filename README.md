@@ -702,11 +702,14 @@ nsticky status                          # daemon, niri, paths and window counts 
 nsticky reload                          # re-read config.toml without restarting the daemon
 nsticky scratchpad [name]               # toggle a scratchpad: hide, show, or start it (no name: the focused window)
 nsticky focus [--app-id ID] [--title T] [-- command...]  # focus a match (cycling), or spawn when nothing matches
+nsticky mark <window_id> <label>         # tag a window (memory only, gone on restart)
+nsticky unmark <window_id>               # remove a window's label
+nsticky marks                           # list every marked window
 ```
 
-`focus` ports nirius `focus-or-spawn` / spawnjump: one keybinding jumps to the
-app or starts it. With several matches it focuses the first one past the
-currently focused window, wrapping around, so repeated presses cycle.
+`mark` is sticky-lite without a config rule: label a window to find it again
+by name. `stage restore` lists urgent windows first (marked `‼`), so the one
+needing attention is on top.
 
 #### Machine-readable output
 
