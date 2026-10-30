@@ -62,8 +62,8 @@ enum Commands {
         title: Option<String>,
     },
     /// Focus a matching window (cycling through matches), or spawn a command
-    /// when nothing matches. One keybinding that jumps to the app or starts
-    /// it (ports nirius `focus-or-spawn` / spawnjump).
+    /// when nothing matches. One keybinding jumps to the app or starts it
+    /// (ports nirius `focus-or-spawn` / spawnjump).
     Focus {
         /// Match by application ID (substring).
         #[arg(long)]
@@ -75,6 +75,21 @@ enum Commands {
         #[arg(last = true)]
         spawn: Vec<String>,
     },
+    /// Tag a window with a short label (nirius `toggle-mark` port without the
+    /// toggle: memory only, gone on restart; listed by `marks`).
+    Mark {
+        /// Window to label.
+        window_id: u64,
+        /// Label for the window.
+        mark: String,
+    },
+    /// Remove a window's label.
+    Unmark {
+        /// Window to unlabel.
+        window_id: u64,
+    },
+    /// List every marked window.
+    Marks,
 }
 
 /// Actions for sticky windows.
@@ -175,6 +190,9 @@ impl Cli {
                 title,
                 spawn,
             },
+            Commands::Mark { window_id, mark } => protocol::Request::Mark { window_id, mark },
+            Commands::Unmark { window_id } => protocol::Request::Unmark { window_id },
+            Commands::Marks => protocol::Request::ListMarks,
         }
     }
 }
@@ -257,14 +275,17 @@ async fn run_terminal_restore(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let mut staged: Vec<&WindowInfo> = staged.iter().collect();
+    staged.sort_by_key(|window| (!window.is_urgent, window.id));
     writeln!(out)?;
     for (i, window) in staged.iter().enumerate() {
         let app_id = window.app_id.as_deref().unwrap_or("?");
         let title = window.title.as_deref().unwrap_or("?");
         writeln!(
             out,
-            " {}. {} — {}  [ID: {}]",
+            " {}. {}{} — {}  [ID: {}]",
             i + 1,
+            if window.is_urgent { "‼ " } else { "" },
             app_id,
             title,
             window.id
@@ -366,6 +387,7 @@ async fn run_stage_restore(
 
 /// Feed the selector one `"<id>\t<app_id> — <title>"` line per staged window and
 /// unstage every id its stdout holds (a multi-select prints several lines).
+/// Urgent windows come first, so the one needing attention is on top.
 async fn run_menu_restore(
     endpoints: &Endpoints,
     spec: &MenuSpec,
@@ -376,11 +398,14 @@ async fn run_menu_restore(
     let menu = spec.parse()?;
     let mut child = menu.spawn()?;
 
+    let mut staged: Vec<&WindowInfo> = staged.iter().collect();
+    staged.sort_by_key(|window| (!window.is_urgent, window.id));
     let input = staged
         .iter()
         .map(|w| {
             format!(
-                "{}\t{} — {}",
+                "{}{}\t{} — {}",
+                if w.is_urgent { "‼ " } else { "" },
                 w.id,
                 w.app_id.as_deref().unwrap_or("?"),
                 w.title.as_deref().unwrap_or("?")
@@ -1363,9 +1388,29 @@ exclude-app-id = "steamwebhelper"
             title: Some(title.to_string()),
             workspace_id: None,
             floating: false,
+            is_urgent: false,
             size: None,
             position: None,
         }
+    }
+
+    fn urgent_window(id: u64, app_id: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            is_urgent: true,
+            ..window(id, app_id, title)
+        }
+    }
+
+    #[test]
+    fn test_restore_sorts_urgent_first() {
+        let mut staged = vec![
+            window(7, "zen", "Inbox"),
+            urgent_window(5, "foot", "build failed"),
+            window(9, "mpv", "video"),
+        ];
+        staged.sort_by_key(|window| (!window.is_urgent, window.id));
+        let ids: Vec<u64> = staged.iter().map(|window| window.id).collect();
+        assert_eq!(ids, vec![5, 7, 9], "urgent first, then by id");
     }
 
     #[test]
@@ -1406,6 +1451,7 @@ exclude-app-id = "steamwebhelper"
             title: None,
             workspace_id: None,
             floating: false,
+            is_urgent: false,
             size: None,
             position: None,
         }];
@@ -1464,6 +1510,7 @@ exclude-app-id = "steamwebhelper"
             title: None,
             workspace_id: None,
             floating: false,
+            is_urgent: false,
             size: None,
             position: None,
         }

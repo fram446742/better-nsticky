@@ -93,6 +93,10 @@ struct AppState {
     /// window comes back at the size and position it had, until the daemon
     /// (or the machine) restarts. Never persisted.
     app_geometry: HashMap<String, FloatingGeometry>,
+    /// Window labels (`nsticky mark`), memory only like geometry: gone on
+    /// restart. nirius `toggle-mark` port without the toggle: explicit
+    /// `mark`/`unmark` verbs, listed by `marks`.
+    marks: HashMap<u64, String>,
 }
 
 #[derive(Clone)]
@@ -1797,13 +1801,39 @@ impl BusinessLogic {
         state.sticky_windows.remove(&window_id);
         state.staged_windows.remove(&window_id);
         state.auto_staged.remove(&window_id);
+        state.marks.remove(&window_id);
         state
             .scratchpad_slots
             .retain(|_, window| window.id != window_id);
         Ok(())
     }
 
-    /// Focus a matching window, cycling through matches past the focused one,
+    /// Tag a window with a short label. Returns whether the label is new
+    /// (false means an existing label was replaced).
+    pub async fn mark_window(&self, window_id: u64, mark: &str) -> Result<bool> {
+        self.ensure_window_exists(window_id).await?;
+        let mut state = self.state.lock().await;
+        Ok(state.marks.insert(window_id, mark.to_string()).is_none())
+    }
+
+    /// Remove a window's label. Returns whether one was present.
+    pub async fn unmark_window(&self, window_id: u64) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        Ok(state.marks.remove(&window_id).is_some())
+    }
+
+    /// Every marked window, sorted by id for stable output.
+    pub async fn list_marks(&self) -> Result<Vec<(String, u64)>> {
+        let state = self.state.lock().await;
+        let mut marks: Vec<(String, u64)> = state
+            .marks
+            .iter()
+            .map(|(id, mark)| (mark.clone(), *id))
+            .collect();
+        marks.sort();
+        Ok(marks)
+    }
+
     /// or spawn a command when nothing matches. Ports nirius `focus-or-spawn`
     /// and spawnjump: one keybinding jumps to the app or starts it.
     pub async fn focus_or_spawn(
@@ -2009,6 +2039,28 @@ impl BusinessLogic {
 
             Request::Windows => reply_json(self.windows().await),
 
+            Request::Mark { window_id, mark } => {
+                reply(self.mark_window(window_id, &mark).await, |was_new| {
+                    if was_new {
+                        format!("Marked {window_id}")
+                    } else {
+                        format!("Updated {window_id}")
+                    }
+                })
+            }
+
+            Request::Unmark { window_id } => {
+                reply(self.unmark_window(window_id).await, |was_present| {
+                    if was_present {
+                        format!("Unmarked {window_id}")
+                    } else {
+                        format!("{window_id} was not marked")
+                    }
+                })
+            }
+
+            Request::ListMarks => reply_json(self.list_marks().await),
+
             Request::FocusOrSpawn {
                 app_id,
                 title,
@@ -2162,6 +2214,7 @@ height = "400"
                 title: Some((*title).to_string()),
                 workspace_id: None,
                 floating: false,
+                is_urgent: false,
                 size: None,
                 position: None,
             })
@@ -2568,6 +2621,30 @@ app-id = "foot"
         niri.set_workspace_focused(3);
         business.handle_workspace_activation(3).await.unwrap();
         assert_eq!(niri.moved_to_id(3), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_mark_unmark_and_list_marks() {
+        let niri = with_layout();
+        let business = business(&niri);
+
+        assert!(business.mark_window(1, "review").await.unwrap());
+        assert!(!business.mark_window(1, "later").await.unwrap());
+        assert_eq!(
+            business.list_marks().await.unwrap(),
+            vec![("later".to_string(), 1)],
+            "re-mark replaces the label"
+        );
+
+        assert!(business.unmark_window(1).await.unwrap());
+        assert!(!business.unmark_window(1).await.unwrap());
+        assert!(business.list_marks().await.unwrap().is_empty());
+
+        let error = business.mark_window(99, "ghost").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Window not found"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,9 @@ pub struct WindowInfo {
     pub workspace_id: Option<u64>,
     #[serde(default)]
     pub floating: bool,
+    /// Whether niri flags the window as needing attention.
+    #[serde(default)]
+    pub is_urgent: bool,
     /// Logical pixels, as niri reports them.
     #[serde(default)]
     pub size: Option<(i32, i32)>,

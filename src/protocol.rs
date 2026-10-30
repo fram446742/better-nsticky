@@ -73,6 +73,18 @@ pub enum Request {
         title: Option<String>,
         spawn: Vec<String>,
     },
+    /// Tag a window with a short label, nirius `toggle-mark` port: sticky-lite
+    /// for windows that need a name without a config rule.
+    Mark {
+        window_id: u64,
+        mark: String,
+    },
+    /// Remove a window's label.
+    Unmark {
+        window_id: u64,
+    },
+    /// List every marked window (`mark -> id` pairs as JSON).
+    ListMarks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
