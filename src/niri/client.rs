@@ -364,15 +364,21 @@ pub(super) fn parse_workspaces(payload: &Value) -> Result<Vec<WorkspaceInfo>> {
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 is_active: workspace.get("is_active").and_then(|v| v.as_bool()) == Some(true),
+                is_focused: workspace.get("is_focused").and_then(|v| v.as_bool()) == Some(true),
             })
         })
         .collect())
 }
 
 fn active_workspace_id(payload: &Value) -> Result<u64> {
-    parse_workspaces(payload)?
-        .into_iter()
-        .find(|workspace| workspace.is_active)
+    let workspaces = parse_workspaces(payload)?;
+    // niri keeps one active workspace per output; only one is focused, and
+    // that is the one sticky windows follow. Fall back to any active one for
+    // older compositors that do not report `is_focused`.
+    workspaces
+        .iter()
+        .find(|workspace| workspace.is_focused)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
         .map(|workspace| workspace.id)
         .context("Active workspace not found")
 }
@@ -857,7 +863,22 @@ mod tests {
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[1].name.as_deref(), Some("main"));
         assert!(workspaces[1].is_active);
+        assert!(!workspaces[1].is_focused, "missing is_focused is false");
         assert_eq!(active_workspace_id(&payload).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_focused_workspace_wins_over_first_active() {
+        // niri keeps one active workspace per output; the focused one is the
+        // one sticky windows follow, even when it is not first.
+        let payload = json!({"Workspaces": [
+            {"id": 1, "output": "DP-1", "is_active": true, "is_focused": false},
+            {"id": 2, "output": "DP-2", "is_active": true, "is_focused": true},
+        ]});
+
+        let workspaces = parse_workspaces(&payload).unwrap();
+        assert!(workspaces[1].is_focused);
+        assert_eq!(active_workspace_id(&payload).unwrap(), 2);
     }
 
     #[test]

@@ -165,14 +165,43 @@ fn is_parking_order(ordered: &[&WorkspaceInfo], occupied: &HashSet<u64>, names: 
 /// focused, or `None` to leave the window where it is.
 ///
 /// `pin` is the output preference list of the matching rule (empty for none),
-/// and `current_output` is where the window is right now.
+/// and `current_output` is where the window is right now. Production uses
+/// [`pin_target_follow`]; this wrapper keeps the original focused-only
+/// behavior for the legacy tests.
+#[cfg(test)]
 pub fn pin_target(
     pin: &[String],
     current_output: Option<&str>,
     layout: &Layout,
     focused_workspace: u64,
 ) -> Option<u64> {
-    if pin.is_empty() {
+    pin_target_follow(pin, current_output, None, layout, focused_workspace, false)
+}
+
+/// [`pin_target`], plus the nirius `if-invisible` policy: with `on_hide`, a
+/// window whose workspace is still the active one of its output stays put.
+/// Only once its workspace would be hidden does it follow the focus.
+pub fn pin_target_follow(
+    pin: &[String],
+    current_output: Option<&str>,
+    current_workspace: Option<u64>,
+    layout: &Layout,
+    focused_workspace: u64,
+    on_hide: bool,
+) -> Option<u64> {
+    if pin.is_empty() && on_hide {
+        // Unpinned on-hide windows ride along only once hidden: while their
+        // workspace is still the active one of the output they sit on, they
+        // stay visible where they are.
+        let visible = match (current_output, current_workspace) {
+            (Some(output), Some(workspace)) => {
+                layout.active_workspace_of(output) == Some(workspace)
+            }
+            _ => false,
+        };
+        if visible {
+            return None;
+        }
         return Some(focused_workspace);
     }
 
@@ -184,6 +213,10 @@ pub fn pin_target(
     };
 
     if current_output == Some(target.as_str()) {
+        if on_hide {
+            // On its own output and still visible there: stay.
+            return None;
+        }
         // Already on its output: follow it only when that output is the one
         // that got the new focused workspace.
         return (layout.output_of(focused_workspace) == Some(target.as_str()))
@@ -334,6 +367,7 @@ mod tests {
                 name: None,
                 output: Some("DP-1".to_string()),
                 is_active: false,
+                is_focused: false,
             },
         ];
         assert!(
@@ -357,6 +391,7 @@ mod tests {
                 name: None,
                 output: Some("DP-1".to_string()),
                 is_active: false,
+                is_focused: false,
             },
         ];
 

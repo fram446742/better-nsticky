@@ -109,6 +109,8 @@ impl FakeNiri {
     }
 
     /// Workspaces as niri reports them, `(id, name, output)` in strip order.
+    /// The first one counts as focused (niri focuses a single workspace); use
+    /// `set_workspace_focused` when the test needs a different one.
     pub fn set_workspaces(&self, workspaces: &[(u64, &str, &str)]) {
         let active = *self.active_workspace.lock();
         let mut per_output: std::collections::HashMap<String, u8> =
@@ -116,7 +118,8 @@ impl FakeNiri {
 
         *self.workspaces.lock() = workspaces
             .iter()
-            .map(|(id, name, output)| {
+            .enumerate()
+            .map(|(position, (id, name, output))| {
                 let idx = per_output.entry((*output).to_string()).or_insert(0);
                 *idx += 1;
                 WorkspaceInfo {
@@ -125,9 +128,17 @@ impl FakeNiri {
                     name: (!name.is_empty()).then(|| (*name).to_string()),
                     output: Some((*output).to_string()),
                     is_active: *id == active,
+                    is_focused: position == 0,
                 }
             })
             .collect();
+    }
+
+    /// Mark a workspace as the focused one, clearing the flag on the rest.
+    pub fn set_workspace_focused(&self, workspace_id: u64) {
+        for workspace in self.workspaces.lock().iter_mut() {
+            workspace.is_focused = workspace.id == workspace_id;
+        }
     }
 
     /// Put a window on a workspace, as niri would report it.

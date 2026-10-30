@@ -176,7 +176,15 @@ async fn accept_cli_connections(
     business_logic: BusinessLogic,
 ) -> Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // A transient accept failure (fd pressure, interrupted syscall)
+            // must not take the whole CLI server down with it.
+            Err(e) => {
+                tracing::warn!("CLI accept failed, still listening: {e:#}");
+                continue;
+            }
+        };
         let business_logic_clone = business_logic.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_cli_connection(stream, business_logic_clone).await {

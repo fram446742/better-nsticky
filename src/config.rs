@@ -101,6 +101,10 @@ pub enum StickyFollow {
     Focused,
     /// Stay on the output the window was on when it became sticky.
     OwnOutput,
+    /// Stay put while its workspace is visible on its output; follow only
+    /// once it would be hidden. Ports nirius `if-invisible`: a video window
+    /// on the second monitor stays there while you work on the first.
+    OnHide,
 }
 
 impl StickyFollow {
@@ -109,6 +113,7 @@ impl StickyFollow {
         match self {
             Self::Focused => "focused",
             Self::OwnOutput => "own-output",
+            Self::OnHide => "on-hide",
         }
     }
 
@@ -116,8 +121,11 @@ impl StickyFollow {
         match value.as_str() {
             Some("focused") => Ok(Self::Focused),
             Some("own-output") => Ok(Self::OwnOutput),
+            Some("on-hide") => Ok(Self::OnHide),
             Some(other) => {
-                bail!("Invalid {key} value: expected \"focused\" or \"own-output\", got {other:?}")
+                bail!(
+                    "Invalid {key} value: expected \"focused\", \"own-output\" or \"on-hide\", got {other:?}"
+                )
             }
             None => bail!("Invalid {key} value: expected a string, got {value}"),
         }
@@ -139,7 +147,12 @@ pub enum Size {
 impl Size {
     fn parse(value: &Value, key: &str, rule_id: &str) -> Result<Self> {
         let size = match value {
-            Value::Integer(pixels) => Self::Fixed(*pixels as i32),
+            Value::Integer(pixels) => {
+                let pixels = i32::try_from(*pixels).map_err(|_| {
+                    anyhow!("Invalid {key} value in {rule_id}: {pixels} does not fit in 32 bits")
+                })?;
+                Self::Fixed(pixels)
+            }
             Value::String(text) => {
                 let text = text.trim();
                 match text.strip_suffix('%') {
@@ -1688,6 +1701,11 @@ output = "  "
             config_from_toml("sticky_follow = \"focused\"\n").sticky_follow(),
             StickyFollow::Focused
         );
+        assert_eq!(
+            config_from_toml("sticky-follow = \"on-hide\"\n").sticky_follow(),
+            StickyFollow::OnHide,
+            "nirius if-invisible port"
+        );
     }
 
     #[test]
@@ -1695,7 +1713,8 @@ output = "  "
         let error = Config::from_toml("sticky-follow = \"sideways\"\n").unwrap_err();
         let message = format!("{error:#}");
         assert!(
-            message.contains("expected \"focused\" or \"own-output\", got \"sideways\""),
+            message
+                .contains("expected \"focused\", \"own-output\" or \"on-hide\", got \"sideways\""),
             "{message}"
         );
     }
@@ -1779,6 +1798,10 @@ width = 0.6
             ("\"0%\"", "percentage must be above 0 and at most 100"),
             ("0", "size must be positive"),
             ("\"wide\"", "expected pixels"),
+            // TOML integers are 64-bit: what does not fit in the IPC's 32-bit
+            // field is rejected instead of wrapping around.
+            ("2147483648", "does not fit in 32 bits"),
+            ("-2147483649", "does not fit in 32 bits"),
         ] {
             let toml = format!("[scratchpad.term]\napp-id = \"foot\"\nwidth = {value}\n");
             let error = Config::from_toml(&toml).unwrap_err();
