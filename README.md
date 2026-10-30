@@ -701,7 +701,12 @@ selector and brings back the ones you pick, more than one if you want.
 nsticky status                          # daemon, niri, paths and window counts (non-zero exit when the daemon is down)
 nsticky reload                          # re-read config.toml without restarting the daemon
 nsticky scratchpad [name]               # toggle a scratchpad: hide, show, or start it (no name: the focused window)
+nsticky focus [--app-id ID] [--title T] [-- command...]  # focus a match (cycling), or spawn when nothing matches
 ```
+
+`focus` ports nirius `focus-or-spawn` / spawnjump: one keybinding jumps to the
+app or starts it. With several matches it focuses the first one past the
+currently focused window, wrapping around, so repeated presses cycle.
 
 #### Machine-readable output
 

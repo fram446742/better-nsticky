@@ -1803,6 +1803,56 @@ impl BusinessLogic {
         Ok(())
     }
 
+    /// Focus a matching window, cycling through matches past the focused one,
+    /// or spawn a command when nothing matches. Ports nirius `focus-or-spawn`
+    /// and spawnjump: one keybinding jumps to the app or starts it.
+    pub async fn focus_or_spawn(
+        &self,
+        app_id: Option<&str>,
+        title: Option<&str>,
+        spawn: &[String],
+    ) -> Result<String> {
+        let windows = self.windows().await?;
+        let matches: Vec<u64> = windows
+            .iter()
+            .filter(|window| {
+                app_id.is_none_or(|needle| {
+                    window
+                        .app_id
+                        .as_deref()
+                        .is_some_and(|hay| hay.contains(needle))
+                }) && title.is_none_or(|needle| {
+                    window
+                        .title
+                        .as_deref()
+                        .is_some_and(|hay| hay.contains(needle))
+                })
+            })
+            .map(|window| window.id)
+            .collect();
+
+        if matches.is_empty() {
+            if spawn.is_empty() {
+                bail!("No window matches");
+            }
+            self.niri.spawn(spawn).await?;
+            return Ok(format!("Starting {}", spawn.join(" ")));
+        }
+
+        // Cycle: first match past the focused window, wrapping around.
+        let focused = self.niri.active_window().await.ok();
+        let target = focused
+            .and_then(|focused| {
+                matches
+                    .iter()
+                    .position(|id| *id == focused)
+                    .map(|position| matches[(position + 1) % matches.len()])
+            })
+            .unwrap_or(matches[0]);
+        self.niri.focus_window(target).await?;
+        Ok(format!("Focused {target}"))
+    }
+
     pub async fn handle_request(&self, request: Request) -> Response {
         // These take the operation lock themselves, and it is not reentrant, so
         // they are handled before dispatch takes it.
@@ -1958,6 +2008,16 @@ impl BusinessLogic {
             }
 
             Request::Windows => reply_json(self.windows().await),
+
+            Request::FocusOrSpawn {
+                app_id,
+                title,
+                spawn,
+            } => reply(
+                self.focus_or_spawn(app_id.as_deref(), title.as_deref(), &spawn)
+                    .await,
+                |message| message,
+            ),
 
             Request::Scratchpad { .. } => {
                 unreachable!("Scratchpad is handled by the caller")
@@ -2508,6 +2568,54 @@ app-id = "foot"
         niri.set_workspace_focused(3);
         business.handle_workspace_activation(3).await.unwrap();
         assert_eq!(niri.moved_to_id(3), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_focus_or_spawn_focuses_and_cycles() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+
+        // First match past the focused window wins; wrap around after.
+        let message = business
+            .focus_or_spawn(Some("foot"), None, &[])
+            .await
+            .unwrap();
+        assert_eq!(message, "Focused 2", "{message}");
+        assert_eq!(
+            niri.window_actions(),
+            vec!["focus 2".to_string()],
+            "focuses the next match"
+        );
+
+        niri.set_active_window(2);
+        let message = business
+            .focus_or_spawn(Some("foot"), None, &[])
+            .await
+            .unwrap();
+        assert_eq!(message, "Focused 1", "cycles back to the first match");
+    }
+
+    #[tokio::test]
+    async fn test_focus_or_spawn_starts_the_command_when_nothing_matches() {
+        let niri = with_layout();
+        let business = business(&niri);
+
+        let message = business
+            .focus_or_spawn(Some("nope"), None, &["foot".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(message, "Starting foot", "{message}");
+        assert_eq!(niri.window_actions(), vec!["spawn foot".to_string()]);
+
+        let error = business
+            .focus_or_spawn(Some("nope"), None, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("No window matches"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -65,6 +65,14 @@ pub enum Request {
     Scratchpad {
         name: Option<String>,
     },
+    /// Focus a matching window (cycling through matches), or spawn a command
+    /// when nothing matches. Ports the nirius `focus-or-spawn` / spawnjump
+    /// pattern: one keybinding that jumps to the app or starts it.
+    FocusOrSpawn {
+        app_id: Option<String>,
+        title: Option<String>,
+        spawn: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +151,21 @@ mod tests {
         let request = Request::ToggleActive;
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(json, r#"{"command":"toggle_active"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    #[test]
+    fn test_request_roundtrip_focus_or_spawn() {
+        let request = Request::FocusOrSpawn {
+            app_id: Some("foot".to_string()),
+            title: None,
+            spawn: vec!["foot".to_string()],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"command":"focus_or_spawn","app_id":"foot","title":null,"spawn":["foot"]}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 

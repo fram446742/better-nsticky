@@ -61,6 +61,20 @@ enum Commands {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Focus a matching window (cycling through matches), or spawn a command
+    /// when nothing matches. One keybinding that jumps to the app or starts
+    /// it (ports nirius `focus-or-spawn` / spawnjump).
+    Focus {
+        /// Match by application ID (substring).
+        #[arg(long)]
+        app_id: Option<String>,
+        /// Match by window title (substring).
+        #[arg(long)]
+        title: Option<String>,
+        /// Command to run when nothing matches.
+        #[arg(last = true)]
+        spawn: Vec<String>,
+    },
 }
 
 /// Actions for sticky windows.
@@ -152,6 +166,15 @@ impl Cli {
             Commands::Scratchpad { name } => protocol::Request::Scratchpad { name },
             Commands::Config { .. } => unreachable!("Config is handled separately"),
             Commands::Windows { .. } => protocol::Request::Windows,
+            Commands::Focus {
+                app_id,
+                title,
+                spawn,
+            } => protocol::Request::FocusOrSpawn {
+                app_id,
+                title,
+                spawn,
+            },
         }
     }
 }
@@ -1148,6 +1171,20 @@ exclude-app-id = "steamwebhelper"
         assert_eq!(cli.into_request(), protocol::Request::Windows);
         let cli = Cli::try_parse_from(["nsticky", "windows", "--title", "gmail"]).unwrap();
         assert_eq!(cli.into_request(), protocol::Request::Windows);
+    }
+
+    #[test]
+    fn test_cli_focus() {
+        let cli =
+            Cli::try_parse_from(["nsticky", "focus", "--app-id", "foot", "--", "foot"]).unwrap();
+        assert_eq!(
+            cli.into_request(),
+            protocol::Request::FocusOrSpawn {
+                app_id: Some("foot".to_string()),
+                title: None,
+                spawn: vec!["foot".to_string()],
+            }
+        );
     }
 
     #[test]
