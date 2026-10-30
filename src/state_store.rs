@@ -212,8 +212,13 @@ impl StateStorage for FileStorage {
         }
 
         // Write-then-rename: a crash mid-write never leaves a truncated state
-        // file behind.
-        let temp = self.path.with_extension("json.tmp");
+        // file behind. The suffix is unique per process so two concurrent
+        // saves (daemon plus a `config check` writing elsewhere aside, the
+        // daemon never saves concurrently with itself) cannot share a temp
+        // file; a stale one from a crashed run is simply overwritten.
+        let temp = self
+            .path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
         let json = serde_json::to_vec_pretty(state)?;
         std::fs::write(&temp, json).with_context(|| format!("Failed to write state: {temp:?}"))?;
         std::fs::rename(&temp, &self.path)
@@ -608,7 +613,8 @@ mod tests {
 
         // The temp file cannot be written, so the state file must survive
         // untouched rather than being truncated or half-replaced.
-        std::fs::create_dir_all(root.join("state.json.tmp")).unwrap();
+        let temp = root.join(format!("state.json.tmp.{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
         let error = storage
             .save(&StoredState::new(vec![StoredSticky::Id(2)], Vec::new()))
             .unwrap_err();

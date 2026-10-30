@@ -441,12 +441,14 @@ becoming unreachable.
 For windows no rule pins, `sticky-follow` decides globally:
 
 ```toml
-sticky-follow = "own-output"    # "focused" (default) or "own-output"
+sticky-follow = "on-hide"    # "focused" (default), "own-output" or "on-hide"
 ```
 
 - `focused`: follow the focused workspace, everywhere (upstream behaviour).
 - `own-output`: stay on the monitor the window was on when it became sticky.
-
+- `on-hide`: stay visible while its workspace shows on its output; follow
+  only once it would be hidden (ports nirius `if-invisible`). A video window
+  on the second monitor stays there while you work on the first.
 A window lives on exactly one workspace, so a single window cannot appear on two
 monitors at once. `own-output` is for keeping several windows of the same
 application on different monitors: pin one rule per window with distinct `title`
@@ -571,7 +573,7 @@ the compositor:
 | `stage-workspace` | `stage` | Name used for the workspace staged windows are parked on |
 | `stage-keep-workspace` | `false` | Keep that workspace (and its name) while nothing is parked |
 | `scratchpad-workspace` | `scratchpad` | Name used for the workspace scratchpad windows are parked on (aliases: `scratchpad_workspace`) |
-| `sticky-follow` | `focused` | How sticky windows without an `output` pin follow workspaces (`focused` or `own-output`) |
+| `sticky-follow` | `focused` | How sticky windows without an `output` pin follow workspaces (`focused`, `own-output` or `on-hide`) |
 | `[sticky.<name>]` | — | Rule that pins matching windows to every workspace |
 | `[stage.<name>]` | — | Rule that parks matching windows on the stage workspace once |
 | `[scratchpad.<name>]` | — | One window toggled by `nsticky scratchpad <name>`: parked ⇄ shown, started if missing. No matching fields means "the focused window" |

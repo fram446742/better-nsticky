@@ -51,6 +51,11 @@ pub struct WorkspaceInfo {
     pub output: Option<String>,
     #[serde(default)]
     pub is_active: bool,
+    /// Whether this workspace also has keyboard focus. niri keeps one active
+    /// workspace per output, but only one of them is focused; sticky windows
+    /// follow the focused one.
+    #[serde(default)]
+    pub is_focused: bool,
 }
 
 impl WorkspaceInfo {
@@ -63,6 +68,7 @@ impl WorkspaceInfo {
             name: None,
             output: None,
             is_active: false,
+            is_focused: false,
         }
     }
 }
