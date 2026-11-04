@@ -91,13 +91,6 @@ installs `/usr/bin/nsticky`. The PKGBUILD fetches the versioned GitHub source
 archive and verifies its SHA-256 checksum. After publishing the recipe to the
 AUR, install it with `paru -S better-nsticky` or an equivalent AUR helper.
 
-To publish or update it: bump `pkgver` in `packaging/PKGBUILD`, run
-`updpkgsums` (or paste the archive's SHA-256), copy `packaging/PKGBUILD` and
-`packaging/LICENSE` into the separate AUR Git checkout, regenerate `.SRCINFO`
-with `makepkg --printsrcinfo > .SRCINFO`, then commit and push those files.
-The AUR stores only the recipe and metadata; the source archive stays on GitHub.
-An AUR account with a registered SSH key is required for Git pushes.
-
 ### Nix
 
 ```bash
