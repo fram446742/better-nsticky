@@ -85,6 +85,9 @@ pub enum Request {
     },
     /// List every marked window (`mark -> id` pairs as JSON).
     ListMarks,
+    /// Toggle floating on the focused window, remembering its tiled width
+    /// (ports niri_float_helper): floating again restores where it was.
+    ToggleFloating,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

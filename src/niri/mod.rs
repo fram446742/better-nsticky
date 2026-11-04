@@ -111,12 +111,14 @@ pub trait Niri: Send + Sync {
     fn focus_window(&self, window_id: u64) -> NiriFuture<'_, ()>;
     /// Put a window in the floating layout.
     fn float_window(&self, window_id: u64) -> NiriFuture<'_, ()>;
+    /// Put a window back in the tiling layout (ports niri_float_helper's
+    /// toggle: tiling restores the width the window had before floating).
+    fn tile_window(&self, window_id: u64) -> NiriFuture<'_, ()>;
     /// Move a floating window, in logical pixels from the working area's corner.
     fn move_floating_window(&self, window_id: u64, x: f64, y: f64) -> NiriFuture<'_, ()>;
     /// Move a workspace to a position on its output (1-based), without focusing
     /// it.
     fn move_workspace_to_index(&self, workspace_id: u64, index: usize) -> NiriFuture<'_, ()>;
-    /// Resize a window, in pixels or as a proportion of the working area.
     fn resize_window(
         &self,
         window_id: u64,

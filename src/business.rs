@@ -89,10 +89,13 @@ struct AppState {
     /// Windows a `[stage.*]` rule already parked in this daemon run, so an
     /// explicit restore is not undone by the next event the window emits.
     auto_staged: HashSet<u64>,
-    /// Last floating geometry per app id, kept only in memory: a PiP-style
-    /// window comes back at the size and position it had, until the daemon
-    /// (or the machine) restarts. Never persisted.
-    app_geometry: HashMap<String, FloatingGeometry>,
+    /// Last floating geometry per app and output, kept only in memory: a
+    /// PiP-style window comes back at the size and position it had, until
+    /// the daemon (or the machine) restarts. Never persisted. One entry
+    /// per monitor, so a video window keeps its placement on each output.
+    /// Keyed by app first, so a lookup is one hash and the across-outputs
+    /// fallback only walks that app's handful of monitor entries.
+    app_geometry: HashMap<String, HashMap<Option<String>, FloatingGeometry>>,
     /// Window labels (`nsticky mark`), memory only like geometry: gone on
     /// restart. nirius `toggle-mark` port without the toggle: explicit
     /// `mark`/`unmark` verbs, listed by `marks`.
@@ -652,12 +655,18 @@ impl BusinessLogic {
 
     /// Size and position to put a window back with. Only a floating window has
     /// a position, and only its size is worth restoring. Visible floating
-    /// geometry is also remembered per app id (in memory only), so a
-    /// PiP-style window comes back where it was after a park cycle.
+    /// geometry is also remembered per (app, output) in memory only, so a
+    /// PiP-style window comes back where it was after a park cycle, on the
+    /// monitor it was on.
     async fn capture_geometry(&self, window_id: u64) -> FloatingGeometry {
         let Ok(windows) = self.windows().await else {
             return (None, None);
         };
+        let output = self
+            .layout()
+            .await
+            .ok()
+            .and_then(|layout| Self::window_output(&windows, &layout, window_id));
         match windows.iter().find(|window| window.id == window_id) {
             Some(window) if window.floating => {
                 let geometry = (window.size, window.position);
@@ -668,7 +677,9 @@ impl BusinessLogic {
                         .lock()
                         .await
                         .app_geometry
-                        .insert(app_id.to_string(), geometry);
+                        .entry(app_id.to_string())
+                        .or_default()
+                        .insert(output, geometry);
                 }
                 geometry
             }
@@ -676,19 +687,54 @@ impl BusinessLogic {
         }
     }
 
-    /// Last floating geometry seen for this app id in this daemon run.
-    async fn remembered_geometry(&self, app_id: Option<&str>) -> FloatingGeometry {
-        match app_id {
-            Some(app_id) => self
-                .state
-                .lock()
-                .await
-                .app_geometry
-                .get(app_id)
-                .copied()
+    /// Last floating geometry seen for this app on this output in this run.
+    /// Falls back to whatever the app had on any output, then to nothing.
+    async fn remembered_geometry(
+        &self,
+        app_id: Option<&str>,
+        output: Option<&str>,
+    ) -> FloatingGeometry {
+        let Some(app_id) = app_id else {
+            return (None, None);
+        };
+        let state = self.state.lock().await;
+        let Some(outputs) = state.app_geometry.get(app_id) else {
+            return (None, None);
+        };
+        outputs
+            .get(&output.map(String::from))
+            .or_else(|| outputs.values().next())
+            .copied()
+            .unwrap_or((None, None))
+    }
+
+    /// The app id and output of a window, for geometry recall. Best effort:
+    /// a compositor query failing here only costs the placement memory, and
+    /// the reason is logged instead of being dropped silently.
+    async fn geometry_context(&self, window_id: u64) -> (Option<String>, Option<String>) {
+        let (app_id, workspace_id) = match self.windows().await {
+            Ok(windows) => windows
+                .iter()
+                .find(|window| window.id == window_id)
+                .map(|window| (window.app_id.clone(), window.workspace_id))
                 .unwrap_or((None, None)),
-            None => (None, None),
-        }
+            Err(e) => {
+                tracing::debug!("Cannot find window {window_id} to recall its app: {e:#}");
+                (None, None)
+            }
+        };
+        let output = match self.layout().await {
+            Ok(layout) => workspace_id
+                .and_then(|id| layout.output_of(id))
+                .map(String::from),
+            Err(e) => {
+                tracing::debug!(
+                    "Cannot read the layout to recall window {window_id}'s output: {e:#}"
+                );
+                None
+            }
+        };
+        (app_id, output)
     }
 
     /// Toggle a scratchpad.
@@ -884,14 +930,10 @@ impl BusinessLogic {
         // state file): fall back to what this app looked like the last time
         // it was visible in this daemon run.
         if remembered_size.is_none() && remembered_position.is_none() {
-            let app_id = self.windows().await.ok().and_then(|windows| {
-                windows
-                    .iter()
-                    .find(|window| window.id == window_id)
-                    .and_then(|window| window.app_id.clone())
-            });
-            (remembered_size, remembered_position) =
-                self.remembered_geometry(app_id.as_deref()).await;
+            let (app_id, output) = self.geometry_context(window_id).await;
+            (remembered_size, remembered_position) = self
+                .remembered_geometry(app_id.as_deref(), output.as_deref())
+                .await;
         }
 
         let workspace_id = self.active_workspace_id().await?;
@@ -1555,15 +1597,13 @@ impl BusinessLogic {
         }
 
         // A staged PiP window comes back where it was: per-window geometry
-        // first, then what this app looked like in this daemon run.
-        let app_id = self.windows().await.ok().and_then(|windows| {
-            windows
-                .iter()
-                .find(|window| window.id == window_id)
-                .and_then(|window| window.app_id.clone())
-        });
+        // first, then what this app looked like on this output in this run.
+        let (app_id, output) = self.geometry_context(window_id).await;
         let remembered = match (staged.size, staged.position) {
-            (None, None) => self.remembered_geometry(app_id.as_deref()).await,
+            (None, None) => {
+                self.remembered_geometry(app_id.as_deref(), output.as_deref())
+                    .await
+            }
             geometry => geometry,
         };
         self.apply_geometry(window_id, remembered).await;
@@ -1692,6 +1732,7 @@ impl BusinessLogic {
             };
             // Refresh what this app looks like while it is visible and
             // floating, so the next park cycle restores the fresh geometry.
+            // Keyed by output: each monitor keeps its own placement.
             if let Some(window) = windows.iter().find(|window| window.id == win_id)
                 && window.floating
                 && let Some(app_id) = window.app_id.clone()
@@ -1701,7 +1742,9 @@ impl BusinessLogic {
                     .lock()
                     .await
                     .app_geometry
-                    .insert(app_id, (window.size, window.position));
+                    .entry(app_id)
+                    .or_default()
+                    .insert(current_output.clone(), (window.size, window.position));
             }
 
             if let Err(e) = self.niri.move_window(win_id, destination).await {
@@ -1883,9 +1926,54 @@ impl BusinessLogic {
         Ok(format!("Focused {target}"))
     }
 
+    /// Toggle floating on the focused window, remembering its tiled width
+    /// (ports niri_float_helper): floating again restores the width niri
+    /// reports for the tiled window, instead of a stale default. Returns
+    /// whether the window is floating now.
+    pub async fn toggle_floating(&self) -> Result<bool> {
+        let window_id = self.active_window_id().await?;
+        let windows = self.windows().await?;
+        let window = windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .with_context(|| format!("Window {window_id} not found in Niri"))?;
+
+        if window.floating {
+            self.niri.tile_window(window_id).await?;
+            return Ok(false);
+        }
+
+        // Remember the tiled width so the next float restores it: niri
+        // reports no geometry worth keeping for tiled windows, but the
+        // app's per-output memory holds the last floating one.
+        let output = match self.layout().await {
+            Ok(layout) => window
+                .workspace_id
+                .and_then(|id| layout.output_of(id).map(String::from)),
+            Err(e) => {
+                tracing::debug!("Cannot read the layout to place the remembered width: {e:#}");
+                None
+            }
+        };
+        if let Some(app_id) = window.app_id.clone()
+            && let Some(size) = window.size
+        {
+            let mut state = self.state.lock().await;
+            let entry = state
+                .app_geometry
+                .entry(app_id)
+                .or_default()
+                .entry(output)
+                .or_insert((None, None));
+            if entry.0.is_none() {
+                entry.0 = Some(size);
+            }
+        }
+        self.niri.float_window(window_id).await?;
+        Ok(true)
+    }
+
     pub async fn handle_request(&self, request: Request) -> Response {
-        // These take the operation lock themselves, and it is not reentrant, so
-        // they are handled before dispatch takes it.
         match &request {
             Request::Reload => {
                 return match self.reload_from_disk().await {
@@ -2074,6 +2162,14 @@ impl BusinessLogic {
             Request::Scratchpad { .. } => {
                 unreachable!("Scratchpad is handled by the caller")
             }
+
+            Request::ToggleFloating => reply(self.toggle_floating().await, |floating| {
+                if floating {
+                    "Floating".to_string()
+                } else {
+                    "Tiled".to_string()
+                }
+            }),
 
             // Handled by the caller before dispatch, like `Scratchpad`.
             Request::Reload => unreachable!("Reload is handled by the caller"),
@@ -3158,6 +3254,52 @@ scratchpad-workspace = "drop"
     }
 
     #[tokio::test]
+    async fn test_geometry_is_remembered_per_output() {
+        let niri = two_monitors();
+        // An empty tail per output, so the stage workspace can be created on
+        // each monitor.
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (3, "three", "DP-1"),
+            (5, "", "DP-1"),
+            (2, "two", "DP-2"),
+            (6, "", "DP-2"),
+        ]);
+        niri.set_windows(&[(1, "mpv", "mpv"), (2, "mpv", "mpv")]);
+        niri.set_window_workspace(1, 1); // DP-1
+        niri.set_window_workspace(2, 2); // DP-2
+        for id in [1, 2] {
+            niri.set_window_floating(id, true);
+        }
+        niri.set_window_geometry(1, (480, 270), (100.0, 100.0));
+        niri.set_window_geometry(2, (640, 360), (2000.0, 200.0));
+        let business = business(&niri);
+
+        // Capture on each output: stage + unstage to force a capture cycle.
+        business.stage_window(1).await.unwrap();
+        business.unstage_window(1, 1).await.unwrap();
+        business.stage_window(2).await.unwrap();
+        business.unstage_window(2, 2).await.unwrap();
+
+        assert_eq!(
+            business
+                .remembered_geometry(Some("mpv"), Some("DP-1"))
+                .await
+                .0,
+            Some((480, 270)),
+            "DP-1 keeps its own placement"
+        );
+        assert_eq!(
+            business
+                .remembered_geometry(Some("mpv"), Some("DP-2"))
+                .await
+                .0,
+            Some((640, 360)),
+            "DP-2 keeps its own placement"
+        );
+    }
+
+    #[tokio::test]
     async fn test_app_geometry_is_forgotten_on_restart() {
         let niri = with_layout();
         niri.set_windows(&[(1, "mpv", "mpv")]);
@@ -3168,20 +3310,50 @@ scratchpad-workspace = "drop"
         let first = business(&niri);
         first.stage_window(1).await.unwrap();
         assert_eq!(
-            first.remembered_geometry(Some("mpv")).await.0,
+            first.remembered_geometry(Some("mpv"), Some("DP-1")).await.0,
             Some((640, 360)),
             "the first run remembers it"
         );
 
         let second = business(&niri);
         assert_eq!(
-            second.remembered_geometry(Some("mpv")).await,
+            second.remembered_geometry(Some("mpv"), Some("DP-1")).await,
             (None, None),
             "a fresh daemon run (reboot) starts with no memory"
         );
         // Fresh instances stage fine; memory is per-process by construction
         // (AppState lives in the BusinessLogic, never touches the disk).
         second.stage_window(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_toggle_floating_tiles_and_floats_back() {
+        let niri = with_layout();
+        niri.set_window_workspace(1, 1);
+        niri.set_window_floating(1, true);
+        niri.set_window_geometry(1, (1100, 480), (730.0, 94.0));
+        let business = business(&niri);
+        niri.set_active_window(1);
+
+        assert!(!business.toggle_floating().await.unwrap());
+        assert_eq!(niri.window_actions(), vec!["tile 1".to_string()]);
+
+        assert!(business.toggle_floating().await.unwrap());
+        let actions = niri.window_actions();
+        assert!(actions.contains(&"float 1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_toggle_floating_needs_a_focused_window() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(99);
+        niri.set_windows(&[]);
+        let error = business.toggle_floating().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Window 99 not found"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
