@@ -6,7 +6,7 @@
 # nsticky without changing its command, configuration, socket or systemd unit.
 
 pkgname=better-nsticky
-pkgver=0.5.0
+pkgver=0.6.4
 pkgrel=1
 pkgdesc="Sticky and staged window management for the niri Wayland compositor (drop-in nsticky)"
 arch=('x86_64')
@@ -19,7 +19,7 @@ provides=('nsticky')
 conflicts=('nsticky')
 options=('!lto') # the release profile already enables LTO
 source=("$pkgname-$pkgver.tar.gz::https://github.com/fram446742/better-nsticky/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('0eec1defd9ba2d4c82ea6195e7fddcf9bb8b7f70a3038e878cd2c7f6959b3693')
+sha256sums=('2a3c580584343de13ab85ba1ad49063f96f33b279f656f8ea7b9ce696f150ebf')
 
 build() {
   cd "$pkgname-$pkgver"
