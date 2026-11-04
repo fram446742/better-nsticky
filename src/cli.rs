@@ -90,8 +90,9 @@ enum Commands {
     },
     /// List every marked window.
     Marks,
+    /// Toggle floating on the focused window (ports niri_float_helper).
+    ToggleFloating,
 }
-
 /// Actions for sticky windows.
 #[derive(Subcommand, Debug)]
 enum StickyAction {
@@ -193,6 +194,7 @@ impl Cli {
             Commands::Mark { window_id, mark } => protocol::Request::Mark { window_id, mark },
             Commands::Unmark { window_id } => protocol::Request::Unmark { window_id },
             Commands::Marks => protocol::Request::ListMarks,
+            Commands::ToggleFloating => protocol::Request::ToggleFloating,
         }
     }
 }
@@ -1403,7 +1405,7 @@ exclude-app-id = "steamwebhelper"
 
     #[test]
     fn test_restore_sorts_urgent_first() {
-        let mut staged = vec![
+        let mut staged = [
             window(7, "zen", "Inbox"),
             urgent_window(5, "foot", "build failed"),
             window(9, "mpv", "video"),

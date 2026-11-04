@@ -27,6 +27,7 @@ pub enum Call {
     FocusWindow,
     MoveFloatingWindow,
     FloatWindow,
+    TileWindow,
     MoveWorkspaceToIndex,
     ResizeWindow,
 }
@@ -45,6 +46,7 @@ impl Call {
             Self::FocusWindow => "focus_window",
             Self::MoveFloatingWindow => "move_floating_window",
             Self::FloatWindow => "float_window",
+            Self::TileWindow => "tile_window",
             Self::MoveWorkspaceToIndex => "move_workspace_to_index",
             Self::ResizeWindow => "resize_window",
         }
@@ -107,6 +109,15 @@ impl FakeNiri {
             })
             .collect();
         fake
+    }
+
+    /// Record the floating state an action leaves the window in, so later
+    /// queries see what a real compositor reports.
+    fn set_window_state(&self, window_id: u64, floating: bool) {
+        let mut windows = self.windows.lock();
+        if let Some(window) = windows.iter_mut().find(|window| window.id == window_id) {
+            window.floating = floating;
+        }
     }
 
     /// Workspaces as niri reports them, `(id, name, output)` in strip order.
@@ -491,9 +502,20 @@ impl Niri for FakeNiri {
         Box::pin(async move {
             self.check_queries()?;
             self.check_failure(Call::FloatWindow)?;
+            self.set_window_state(window_id, true);
             self.window_actions
                 .lock()
                 .push(format!("float {window_id}"));
+            Ok(())
+        })
+    }
+
+    fn tile_window(&self, window_id: u64) -> NiriFuture<'_, ()> {
+        Box::pin(async move {
+            self.check_queries()?;
+            self.check_failure(Call::TileWindow)?;
+            self.set_window_state(window_id, false);
+            self.window_actions.lock().push(format!("tile {window_id}"));
             Ok(())
         })
     }

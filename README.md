@@ -705,11 +705,16 @@ nsticky focus [--app-id ID] [--title T] [-- command...]  # focus a match (cyclin
 nsticky mark <window_id> <label>         # tag a window (memory only, gone on restart)
 nsticky unmark <window_id>               # remove a window's label
 nsticky marks                           # list every marked window
+nsticky toggle-floating                 # float/tile the focused window, remembering its floating size per output
 ```
 
 `mark` is sticky-lite without a config rule: label a window to find it again
 by name. `stage restore` lists urgent windows first (marked `‼`), so the one
 needing attention is on top.
+
+`toggle-floating` tiles a floating window and floats a tiled one. The window's
+floating size is remembered per monitor while it was floating, so floating it
+again restores that size instead of niri's tiled default.
 
 #### Machine-readable output
 

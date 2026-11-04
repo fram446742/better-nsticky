@@ -226,6 +226,14 @@ impl Niri for NiriClient {
         })
     }
 
+    fn tile_window(&self, window_id: u64) -> NiriFuture<'_, ()> {
+        Box::pin(async move {
+            let action = json!({ "Action": { "MoveWindowToTiling": { "id": window_id } } });
+            self.request(&action).await?;
+            Ok(())
+        })
+    }
+
     fn move_floating_window(&self, window_id: u64, x: f64, y: f64) -> NiriFuture<'_, ()> {
         Box::pin(async move {
             let action = json!({
