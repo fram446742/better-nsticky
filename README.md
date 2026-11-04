@@ -653,6 +653,17 @@ you ask for it with `nsticky --replace`. The CLI socket is created with mode
 `0600`, so only its owner can talk to it, and requests larger than 64 KiB are
 rejected instead of being buffered.
 
+The event stream survives a compositor restart: when niri closes or refuses the
+stream — or starts after the daemon did — the daemon retries with a growing
+delay (1s, 2s, 4s, capped at 30s) and keeps serving `nsticky` commands meanwhile.
+Sticky windows resume following focus on their own; no daemon restart needed:
+
+```bash
+$ systemctl restart niri.service     # Compositor restarts...
+Nov 03 10:12:34 nsticky[2121]: Niri event stream ended: reconnecting
+Nov 03 10:12:36 nsticky[2121]: nsticky daemon started.  # ...windows follow again
+```
+
 The CLI reaches the daemon over `$XDG_RUNTIME_DIR/nsticky/cli.sock`, falling back
 to `/tmp/niri_sticky_cli.sock` when that variable is unset. Both sides must agree
 on the path: after upgrading from a version that used the fixed `/tmp` socket,
@@ -837,6 +848,17 @@ cargo fmt --check
 cargo build && scripts/e2e-smoke.sh                         # end-to-end
 ```
 
+If your global Cargo config uses the cranelift codegen backend for development
+(`[profile.dev] codegen-backend = "cranelift"`), the test binary can abort at the
+end with `llvm.x86.sse2.pmulhu.w is not yet supported`
+([rustc_codegen_cranelift#171](https://github.com/rust-lang/rustc_codegen_cranelift/issues/171)),
+nondeterministically and in unrelated tests. Run the suite against the standard
+backend instead; nothing about the code needs changing:
+
+```bash
+RUSTFLAGS="-Zcodegen-backend=llvm" cargo test
+```
+
 ### End-to-end smoke test
 
 `scripts/e2e-smoke.sh` runs the real binary against a fake niri IPC server in an
@@ -852,7 +874,9 @@ workspace.
 - scratchpads: their own workspace (separate from the stage), the geometry they
   remember, and the empty area being released when the window comes back;
 - the parking areas ending up at the end of the strip, in order, and following it
-  down again when a workspace appears below them;
+  down again when a workspace appears below them — deferred while niri's
+  overview is open, so the strip does not reflow under the user's eyes, then
+  applied once on close;
 - monitor pinning: a window on the wrong monitor is put back, a pinned window
   ignores other monitors' activations and follows its own, `sticky-follow =
   "own-output"` holds, and reloading a configuration re-pins tracked windows;

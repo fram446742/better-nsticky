@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use std::future;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -83,7 +84,7 @@ pub async fn start(takeover: Takeover) -> Result<()> {
     let niri = Arc::new(NiriClient::from_env()?);
     let business_logic = BusinessLogic::new(
         config,
-        crate::config::Config::default_config_path(),
+        Config::default_config_path(),
         niri,
         Arc::new(storage),
     );
@@ -123,14 +124,7 @@ async fn serve(
     tokio::spawn(watch_hangup(business_logic.clone()));
 
     tokio::spawn(async move {
-        match events {
-            Ok(events) => {
-                if let Err(e) = run_watcher(business_logic, events).await {
-                    tracing::error!("Watcher error: {e:?}");
-                }
-            }
-            Err(e) => tracing::error!("Cannot follow Niri events: {e:#}"),
-        }
+        watch_forever(business_logic, events, get_event_stream, reconnect_delay).await;
     });
 
     tracing::info!("nsticky daemon started.");
@@ -227,7 +221,17 @@ async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
         }
     }
 
-    Ok((String::from_utf8_lossy(&kept).trim().to_string(), truncated))
+    // One owned String, trimmed in place: the old lossy-trim-copy path
+    // allocated twice whenever the bytes were not valid UTF-8. The trim
+    // boundaries are taken from `str`'s own views, so multibyte leftovers
+    // (an oversized request cut mid-character) stay on a char boundary.
+    let mut line = String::from_utf8_lossy(&kept).into_owned();
+    let start = line.len() - line.trim_start().len();
+    let end = line.trim_end().len();
+    line.drain(..start);
+    line.truncate(end - start);
+
+    Ok((line, truncated))
 }
 
 async fn handle_cli_connection(stream: UnixStream, business_logic: BusinessLogic) -> Result<()> {
@@ -273,6 +277,60 @@ trait EventSource {
     fn next_event(&mut self) -> impl Future<Output = Result<Option<NiriEvent>>> + Send;
 }
 
+/// Delay before the next attempt to reach the compositor's event stream.
+/// Grows per consecutive failure up to a cap, so a compositor that is down
+/// for a while is waited for without hammering the socket.
+const MAX_RECONNECT_SECS: u64 = 30;
+
+fn reconnect_delay(failures: u32) -> Duration {
+    Duration::from_secs(
+        1u64.saturating_mul(2u64.saturating_pow(failures))
+            .min(MAX_RECONNECT_SECS),
+    )
+}
+
+/// Follow the compositor's event stream until the process ends.
+///
+/// A stream that ends (the compositor closed it — it is restarting) or none
+/// that can be opened are retried with a growing delay: nsticky keeps
+/// managing windows through its CLI the whole time, and sticky windows
+/// resume following the compositor when it is back.
+async fn watch_forever<S, F, Fut, D>(
+    business_logic: BusinessLogic,
+    initial: Result<S>,
+    mut open: F,
+    delay: D,
+) where
+    S: EventSource,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<S>>,
+    D: Fn(u32) -> Duration,
+{
+    let mut failures = 0;
+    let mut events = Some(initial);
+    loop {
+        let source = match events.take() {
+            Some(source) => source,
+            None => open().await,
+        };
+        match source {
+            Ok(stream) => {
+                failures = 0;
+                let result = run_watcher(business_logic.clone(), stream).await;
+                if let Err(e) = result {
+                    tracing::error!("Watcher error: {e:?}");
+                }
+                tracing::warn!("Niri event stream ended: reconnecting");
+            }
+            Err(e) => {
+                failures += 1;
+                tracing::warn!("Cannot follow Niri event stream (attempt {failures}): {e:#}");
+            }
+        }
+        tokio::time::sleep(delay(failures)).await;
+    }
+}
+
 impl EventSource for NiriEventStream {
     fn next_event(&mut self) -> impl Future<Output = Result<Option<NiriEvent>>> + Send {
         NiriEventStream::next_event(self)
@@ -315,6 +373,11 @@ async fn run_watcher(business_logic: BusinessLogic, mut events: impl EventSource
                     tracing::debug!("Failed to reorder the parking workspaces: {e:#}");
                 }
             }
+            NiriEvent::OverviewChanged { open } => {
+                if let Err(e) = business_logic.handle_overview_changed(open).await {
+                    tracing::debug!("Failed to handle the overview change: {e:#}");
+                }
+            }
             NiriEvent::ConfigLoaded { failed } => {
                 if failed {
                     tracing::warn!("niri failed to load its configuration");
@@ -332,9 +395,7 @@ async fn run_watcher(business_logic: BusinessLogic, mut events: impl EventSource
         }
     }
 
-    tracing::warn!(
-        "Niri closed the event stream: sticky windows will not follow workspaces until the daemon restarts"
-    );
+    // A stream that ends is normal now: `watch_forever` reconnects.
     Ok(())
 }
 
@@ -545,6 +606,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_watcher_defers_parking_while_the_overview_is_open() {
+        let niri = Arc::new(FakeNiri::with_windows(&[
+            (1, "fake", "Fake One"),
+            (2, "fake", "Fake Two"),
+            (3, "fake", "Fake Three"),
+        ]));
+        let (business, config_path) = business_with_config(
+            &niri,
+            "stage-workspace = \"parking\"\nscratchpad-workspace = \"drop\"\n",
+        );
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (2, "drop", "DP-1"),
+            (3, "parking", "DP-1"),
+            (5, "five", "DP-1"),
+            (6, "", "DP-1"),
+        ]);
+        niri.set_window_workspace(1, 1);
+        niri.set_window_workspace(2, 2);
+        niri.set_window_workspace(3, 3);
+
+        // The overview opens, a workspace change arrives while the user is
+        // looking at the strip: nothing moves. Closing re-runs the reorder.
+        run_watcher(
+            business,
+            FakeEvents::new([
+                NiriEvent::OverviewChanged { open: true },
+                NiriEvent::WorkspacesChanged,
+                NiriEvent::OverviewChanged { open: false },
+            ]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            niri.workspace_naming().join("; "),
+            "movews 2 5; movews 3 6",
+            "the deferred reorder runs once, when the overview closes"
+        );
+        cleanup(&config_path);
+    }
+
+    #[tokio::test]
     async fn test_watcher_forwards_window_events() {
         let niri = fake_niri();
         let (business, config_path) =
@@ -605,6 +709,66 @@ mod tests {
 
         assert!(error.to_string().contains("niri hung up"), "{error}");
         cleanup(&config_path);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_reconnects_when_the_stream_ends() {
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let niri = fake_niri();
+        let (business, config_path) = business_with_config(&niri, "");
+        business.add_sticky_window(1).await.unwrap();
+
+        // First stream ends right away; the reconnect opens a second one that
+        // carries a real event. The window follows without a daemon restart.
+        let streams = Arc::new(AsyncMutex::new(vec![
+            FakeEvents::new([]),
+            FakeEvents::new([NiriEvent::WorkspaceActivated {
+                id: 9,
+                focused: true,
+            }]),
+        ]));
+        let open = {
+            let streams = Arc::clone(&streams);
+            move || {
+                let streams = Arc::clone(&streams);
+                async move {
+                    let mut streams = streams.lock().await;
+                    streams
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("out of scripted streams"))
+                }
+            }
+        };
+        // Built before the loop: a guard temporary inside the argument list
+        // would live across the whole `timeout().await` and deadlock `open`.
+        let initial = streams.lock().await.remove(0);
+        // The loop never finishes; the timeout just ends the test once the
+        // second stream has been consumed (a short injected delay keeps the
+        // retries from spinning).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            watch_forever(business.clone(), Ok(initial), open, |_| {
+                std::time::Duration::from_millis(10)
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            niri.moved_to_id(9),
+            vec![1],
+            "the second stream's event was followed after the first ended"
+        );
+        cleanup(&config_path);
+    }
+
+    #[test]
+    fn test_reconnect_delay_grows_and_caps() {
+        assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(16));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(30), "capped");
+        assert_eq!(reconnect_delay(20), Duration::from_secs(30), "still capped");
     }
 
     #[tokio::test]
@@ -923,6 +1087,14 @@ mod tests {
                 "{request:?} -> {replies:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_cli_connection_trims_surrounding_whitespace_from_requests() {
+        // Padding comes from sloppy scripts; trim never made requests fail.
+        let replies = replies_to(b"   \t {\"command\":\"list\"} \r\n").await;
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(replies[0].contains(r#""data":"[]""#), "{replies:?}");
     }
 
     #[tokio::test]
