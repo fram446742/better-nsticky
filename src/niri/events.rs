@@ -1,7 +1,7 @@
 //! Niri event stream: the events nsticky reacts to and the connection that
 //! delivers them.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::Path;
 
@@ -39,6 +39,11 @@ pub enum NiriEvent {
     /// The payload is not kept: a handler asks the compositor for the current
     /// layout, since a payload can be stale by the time it is handled.
     WorkspacesChanged,
+    /// The overview opened or closed. While it is open the user is looking at
+    /// every workspace, so nsticky must not shuffle the strip underneath them.
+    OverviewChanged {
+        open: bool,
+    },
 }
 
 fn parse_niri_event(v: &Value) -> Option<NiriEvent> {
@@ -76,6 +81,14 @@ fn parse_niri_event(v: &Value) -> Option<NiriEvent> {
         return Some(NiriEvent::WorkspacesChanged);
     }
 
+    if let Some(overview) = v.get("OverviewOpenedOrClosed") {
+        let open = overview
+            .get("is_open")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return Some(NiriEvent::OverviewChanged { open });
+    }
+
     if let Some(loaded) = v.get("ConfigLoaded") {
         let failed = loaded
             .get("failed")
@@ -93,6 +106,7 @@ fn parse_niri_event(v: &Value) -> Option<NiriEvent> {
 }
 
 /// Stream of Niri events, connected with the `EventStream` IPC request.
+#[derive(Debug)]
 pub struct NiriEventStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
 }
@@ -135,14 +149,34 @@ pub async fn get_event_stream() -> Result<NiriEventStream> {
 async fn open_event_stream(socket_path: &Path) -> Result<NiriEventStream> {
     let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut writer) = stream.into_split();
-    let reader = BufReader::new(reader);
+    let mut reader = BufReader::new(reader);
 
     let cmd_str = serde_json::to_string(&serde_json::json!("EventStream"))? + "\n";
     writer.write_all(cmd_str.as_bytes()).await?;
     writer.flush().await?;
     drop(writer);
 
-    Ok(NiriEventStream { reader })
+    // The request is answered before events flow, so the handshake reply has
+    // to be read here: a refusal must end the open with an error instead of
+    // leaving the stream silently blocked waiting for events that will never
+    // come (the reply used to be just one more line the parser skipped).
+    let mut reply = String::new();
+    reader.read_line(&mut reply).await?;
+    if reply.trim().is_empty() {
+        bail!("Niri closed the connection before answering the EventStream request");
+    }
+    let value: Value = serde_json::from_str(reply.trim())
+        .with_context(|| format!("Unexpected EventStream handshake reply: {reply:?}"))?;
+    if value.get("Ok").is_some() {
+        return Ok(NiriEventStream { reader });
+    }
+    if value.get("Err").is_some() {
+        bail!(
+            "Niri refused the EventStream request: {}",
+            value["Err"].as_str().unwrap_or("unknown error")
+        );
+    }
+    bail!("Unexpected EventStream handshake reply: {value}");
 }
 
 #[cfg(test)]
@@ -251,6 +285,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_overview_opened_or_closed() {
+        assert!(matches!(
+            parse_niri_event(&json!({ "OverviewOpenedOrClosed": { "is_open": true } })),
+            Some(NiriEvent::OverviewChanged { open: true })
+        ));
+        assert!(matches!(
+            parse_niri_event(&json!({ "OverviewOpenedOrClosed": { "is_open": false } })),
+            Some(NiriEvent::OverviewChanged { open: false })
+        ));
+        // A payload without the flag counts as closed: parking stays deferred
+        // only while the overview is positively open.
+        assert!(matches!(
+            parse_niri_event(&json!({ "OverviewOpenedOrClosed": {} })),
+            Some(NiriEvent::OverviewChanged { open: false })
+        ));
+    }
+
+    #[test]
     fn test_parse_window_opened_or_changed() {
         let event = parse_niri_event(&json!({
             "WindowOpenedOrChanged": {
@@ -344,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_stream_skips_the_handshake_and_unrelated_events() {
+    async fn test_the_stream_skips_events_nsticky_does_not_use() {
         let stub = Stub::start(vec![
             r#"{"Ok":"Handled"}"#.to_string(),
             r#"{"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["us"]}}}"#.to_string(),
@@ -355,6 +407,11 @@ mod tests {
         .await;
 
         let mut stream = open_event_stream(&stub.path()).await.unwrap();
+        // The overview event is used; the layout and focus events are skipped.
+        assert!(matches!(
+            stream.next_event().await.unwrap(),
+            Some(NiriEvent::OverviewChanged { open: false })
+        ));
         assert!(matches!(
             stream.next_event().await.unwrap(),
             Some(NiriEvent::WorkspaceActivated {
@@ -370,6 +427,7 @@ mod tests {
     #[tokio::test]
     async fn test_next_event_skips_lines_it_cannot_parse() {
         let stub = Stub::start(vec![
+            r#"{"Ok":"Handled"}"#.to_string(),
             String::new(),
             "not json at all".to_string(),
             r#"{"WorkspaceActivated":{}}"#.to_string(),
@@ -391,6 +449,7 @@ mod tests {
     #[tokio::test]
     async fn test_window_opened_or_changed_tolerates_null_fields() {
         let stub = Stub::start(vec![
+            r#"{"Ok":"Handled"}"#.to_string(),
             r#"{"WindowOpenedOrChanged":{"window":{"id":7,"app_id":null,"title":null,"workspace_id":null,"is_floating":null}}}"#
                 .to_string(),
         ])
@@ -416,6 +475,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_loaded_and_workspaces_changed_arrive_through_the_stream() {
         let stub = Stub::start(vec![
+            r#"{"Ok":"Handled"}"#.to_string(),
             r#"{"ConfigLoaded":{"failed":"yes"}}"#.to_string(),
             r#"{"ConfigLoaded":{"failed":true}}"#.to_string(),
             r#"{"WorkspacesChanged":{"workspaces":[{"id":1,"idx":1,"name":null,"output":"DP-1","is_active":true}]}}"#
@@ -448,13 +508,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_refused_handshake_is_swallowed_by_the_stream() {
-        // The handshake reply is never read, so an `Err` reply is another line
-        // the parser does not recognise and the stream goes quiet (a known gap).
+    async fn test_a_refused_handshake_ends_the_open_with_an_error() {
+        // The `Err` reply is read at open: the stream is never left blocked on
+        // events that a compositor which refused the request will not send.
         let stub = Stub::start(vec![r#"{"Err":"unknown request"}"#.to_string()]).await;
 
-        let mut stream = open_event_stream(&stub.path()).await.unwrap();
-        assert!(stream.next_event().await.unwrap().is_none());
+        let error = open_event_stream(&stub.path()).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Niri refused the EventStream request"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unreadable_handshake_ends_the_open_with_an_error() {
+        let stub = Stub::start(vec!["not a handshake".to_string()]).await;
+
+        let error = open_event_stream(&stub.path()).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Unexpected EventStream handshake"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_connection_closed_before_the_handshake_ends_the_open_with_an_error() {
+        // One line, read as a (broken) handshake... the connection then closes,
+        // which surfaces as a failed open, not a silent dead stream.
+        let stub = Stub::start(vec![]).await;
+
+        let error = open_event_stream(&stub.path()).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("closed the connection"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -237,6 +237,16 @@ start_daemon() { # extra args...
   DAEMON_PID=$!
   for _ in $(seq 1 50); do
     nsticky windows >/dev/null 2>&1 && return 0
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      local status=0
+      wait "$DAEMON_PID" 2>/dev/null || status=$?
+      if [[ $status -ge 128 ]]; then
+        echo "daemon crashed (aborted?). A cranelift dev backend aborts the binary" >&2
+        echo "(rustc_codegen_cranelift#171): build with" >&2
+        echo "  RUSTFLAGS='-Zcodegen-backend=llvm' cargo build" >&2
+      fi
+      return 1
+    fi
     sleep 0.1
   done
   echo "daemon did not become ready"

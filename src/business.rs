@@ -100,6 +100,9 @@ struct AppState {
     /// restart. nirius `toggle-mark` port without the toggle: explicit
     /// `mark`/`unmark` verbs, listed by `marks`.
     marks: HashMap<u64, String>,
+    /// Whether niri's overview is open. While it is, the strip must not be
+    /// reordered: the user is looking straight at it.
+    overview_open: bool,
 }
 
 #[derive(Clone)]
@@ -1114,6 +1117,13 @@ impl BusinessLogic {
     /// them would make each move undo the previous one.
     pub async fn ensure_parking_order(&self) -> Result<()> {
         let _operation = self.operations.lock().await;
+        // While the overview is open the user is looking at the whole strip:
+        // moving workspaces then makes it reflow under their eyes. The close
+        // event runs this again, so nothing is lost by waiting.
+        if self.state.lock().await.overview_open {
+            tracing::debug!("Overview is open: leaving the parking order for its close");
+            return Ok(());
+        }
         let workspaces = self.niri.workspaces().await?;
         let windows = self.windows().await?;
         let occupied: HashSet<u64> = windows
@@ -1130,6 +1140,31 @@ impl BusinessLogic {
         }
 
         Ok(())
+    }
+
+    /// Note that the overview opened or closed.
+    ///
+    /// Opening only records the fact: parking workspaces stay put until the
+    /// user is out of the overview. Closing re-runs the reorder, which may
+    /// have been deferred several times while it was open.
+    pub async fn handle_overview_changed(&self, open: bool) -> Result<()> {
+        let changed = {
+            let mut state = self.state.lock().await;
+            let changed = state.overview_open != open;
+            state.overview_open = open;
+            changed
+        };
+        if !changed {
+            return Ok(());
+        }
+
+        if open {
+            tracing::debug!("Overview opened: parking workspaces are left alone");
+            return Ok(());
+        }
+
+        tracing::debug!("Overview closed: restoring the parking order");
+        self.ensure_parking_order().await
     }
 
     /// Every open window.
@@ -3077,6 +3112,75 @@ scratchpad-workspace = "drop"
             "movews 2 5; movews 3 6",
             "the second look must be satisfied"
         );
+    }
+
+    #[tokio::test]
+    async fn test_parking_order_waits_for_the_overview_to_close() {
+        let niri = with_layout();
+        let business = business_with_config(
+            &niri,
+            r#"
+stage-workspace = "parking"
+scratchpad-workspace = "drop"
+"#,
+        );
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (2, "drop", "DP-1"),
+            (3, "parking", "DP-1"),
+            (5, "five", "DP-1"),
+            (6, "", "DP-1"),
+        ]);
+        niri.set_window_workspace(1, 1);
+        niri.set_window_workspace(2, 2);
+        niri.set_window_workspace(3, 3);
+
+        // The user is looking at the strip: nothing may move under them.
+        business.handle_overview_changed(true).await.unwrap();
+        business.ensure_parking_order().await.unwrap();
+        assert_eq!(
+            niri.workspace_naming().join("; "),
+            "",
+            "no workspace moves while the overview is open"
+        );
+
+        // Closing it re-runs the reorder that was deferred.
+        business.handle_overview_changed(false).await.unwrap();
+        assert_eq!(
+            niri.workspace_naming().join("; "),
+            "movews 2 5; movews 3 6",
+            "the deferred reorder runs once the overview closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_overview_events_do_not_reorder_twice() {
+        let niri = with_layout();
+        let business = business_with_config(
+            &niri,
+            r#"
+stage-workspace = "parking"
+scratchpad-workspace = "drop"
+"#,
+        );
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (2, "drop", "DP-1"),
+            (3, "parking", "DP-1"),
+            (4, "", "DP-1"),
+        ]);
+        niri.set_window_workspace(1, 1);
+        niri.set_window_workspace(2, 2);
+        niri.set_window_workspace(3, 3);
+
+        // Already in order: opening and closing is a no-op, not a move.
+        business.handle_overview_changed(true).await.unwrap();
+        business.handle_overview_changed(false).await.unwrap();
+        assert_eq!(niri.workspace_naming().join("; "), "");
+
+        // A repeated "closed" while already closed does not reorder either.
+        business.handle_overview_changed(false).await.unwrap();
+        assert_eq!(niri.workspace_naming().join("; "), "");
     }
 
     #[tokio::test]

@@ -220,7 +220,18 @@ impl StateStorage for FileStorage {
             .path
             .with_extension(format!("json.tmp.{}", std::process::id()));
         let json = serde_json::to_vec_pretty(state)?;
-        std::fs::write(&temp, json).with_context(|| format!("Failed to write state: {temp:?}"))?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp)
+                .with_context(|| format!("Failed to write state: {temp:?}"))?;
+            file.write_all(&json)
+                .with_context(|| format!("Failed to write state: {temp:?}"))?;
+            // Flush the new file to disk before it takes the old one's name:
+            // without this, a power loss at the wrong moment can rename an
+            // empty file over the surviving state.
+            file.sync_all()
+                .with_context(|| format!("Failed to flush state: {temp:?}"))?;
+        }
         std::fs::rename(&temp, &self.path)
             .with_context(|| format!("Failed to replace state: {:?}", self.path))?;
         Ok(())
