@@ -30,10 +30,17 @@ windows itself.
 | State | in memory only | persisted, reconciled with the compositor on start |
 | Menu | `split_whitespace()` | shell-style quoting, array form, [Vicinae](https://www.vicinae.com/) discovery, never a shell |
 | Monitors | sticky windows follow every activation | per-rule `output` pins, `sticky-follow = "own-output"`, activations that did not take focus are ignored |
+| Follow policy | follow focus only | `sticky-follow = "focused"` / `"own-output"` / `"on-hide"` (nirius `if-invisible`: stay visible, follow only once hidden) |
+| Floating memory | — | `nsticky toggle-floating`; floating geometry remembered per app **and** output, so a PiP window comes back where it was |
+| Window labels | — | `nsticky mark <id> <label>` / `unmark` / `marks`: memory-only tags, cleared with the window and on restart |
+| Find or start | — | `nsticky focus --app-id X -- cmd`: focus the next match (repeats cycle), or spawn when nothing matches |
+| Stage restore | menu of ids | urgent windows listed first (marked `‼`), then the rest |
 | Scratchpads | — | `[scratchpad.<name>]` + one keybinding: hide/show/spawn a dropdown, floating and sized |
 | Matching | app id + title | also `floating = true/false`, rule reload (`nsticky reload`, `SIGHUP`, niri's own reload) |
 | CLI | — | `config check`, tables + `--json`, non-zero exits on failure |
 | Daemon | — | operation lock, single instance, socket `0600`, bounded requests, one IPC connection |
+| Compositor restart | event stream ends for good | reconnects with a capped backoff (1s→30s), CLI keeps working meanwhile |
+| Overview | — | the parking areas are not reordered while niri's overview is open, only once it closes |
 
 ## Installation
 
@@ -84,9 +91,10 @@ installs `/usr/bin/nsticky`. The PKGBUILD fetches the versioned GitHub source
 archive and verifies its SHA-256 checksum. After publishing the recipe to the
 AUR, install it with `paru -S better-nsticky` or an equivalent AUR helper.
 
-To publish or update it, copy `packaging/PKGBUILD` and `packaging/LICENSE` into
-the separate AUR Git checkout. Generate `.SRCINFO` with
-`makepkg --printsrcinfo > .SRCINFO`, then commit and push all three files.
+To publish or update it: bump `pkgver` in `packaging/PKGBUILD`, run
+`updpkgsums` (or paste the archive's SHA-256), copy `packaging/PKGBUILD` and
+`packaging/LICENSE` into the separate AUR Git checkout, regenerate `.SRCINFO`
+with `makepkg --printsrcinfo > .SRCINFO`, then commit and push those files.
 The AUR stores only the recipe and metadata; the source archive stays on GitHub.
 An AUR account with a registered SSH key is required for Git pushes.
 
