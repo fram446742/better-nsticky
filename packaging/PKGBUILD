@@ -19,7 +19,7 @@ provides=('nsticky')
 conflicts=('nsticky')
 options=('!lto') # the release profile already enables LTO
 source=("$pkgname-$pkgver.tar.gz::https://github.com/fram446742/better-nsticky/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('2a3c580584343de13ab85ba1ad49063f96f33b279f656f8ea7b9ce696f150ebf')
+sha256sums=('d4f7fa47f9c6bccef50c6b5bf919a7fd3003adff02800493b9179eb73a16cc92')
 
 build() {
   cd "$pkgname-$pkgver"
