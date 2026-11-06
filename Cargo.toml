@@ -21,7 +21,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-toml = "1.1.8"
+toml = "1.2.0"
 regex = "1.13.1"
 shell-words = "1.1.1"
 dirs = "7.0.0"
