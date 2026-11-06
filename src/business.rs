@@ -103,6 +103,10 @@ struct AppState {
     /// Whether niri's overview is open. While it is, the strip must not be
     /// reordered: the user is looking straight at it.
     overview_open: bool,
+    /// Windows whose remembered geometry was already applied in this run, so a
+    /// later event from the same window does not snap it back while the user
+    /// is resizing it.
+    restored_windows: HashSet<u64>,
 }
 
 #[derive(Clone)]
@@ -709,6 +713,80 @@ impl BusinessLogic {
             .or_else(|| outputs.values().next())
             .copied()
             .unwrap_or((None, None))
+    }
+
+    /// Remember a floating window's geometry, and put back what this app had
+    /// the last time it floated — once per window.
+    ///
+    /// This is what makes a PiP window come back where it was after it is
+    /// closed and reopened: the window id is new, so only the per-app memory
+    /// can carry the placement over. A window that has already been restored
+    /// only records its geometry, so the user's own resizes are never undone.
+    async fn maintain_geometry(&self, window_id: u64, floating: bool) -> Result<()> {
+        if !floating {
+            return Ok(());
+        }
+
+        let windows = match self.windows().await {
+            Ok(windows) => windows,
+            Err(e) => {
+                tracing::debug!("Cannot read windows to keep {window_id}'s geometry: {e:#}");
+                return Ok(());
+            }
+        };
+        let Some(window) = windows.iter().find(|window| window.id == window_id) else {
+            return Ok(());
+        };
+        let Some(app_id) = window.app_id.clone() else {
+            return Ok(());
+        };
+        let output = self.layout().await.ok().and_then(|layout| {
+            window
+                .workspace_id
+                .and_then(|id| layout.output_of(id).map(String::from))
+        });
+        let current = (window.size, window.position);
+
+        let remembered = {
+            let state = self.state.lock().await;
+            if state.restored_windows.contains(&window_id) {
+                None
+            } else {
+                state
+                    .app_geometry
+                    .get(&app_id)
+                    .and_then(|outputs| {
+                        outputs
+                            .get(&output)
+                            .or_else(|| outputs.values().next())
+                            .copied()
+                    })
+                    .filter(|geometry| geometry.0.is_some() || geometry.1.is_some())
+            }
+        };
+
+        match remembered {
+            Some(geometry) => {
+                self.state.lock().await.restored_windows.insert(window_id);
+                tracing::debug!("Restoring {app_id} window {window_id} to its remembered geometry");
+                self.apply_geometry(window_id, geometry).await;
+            }
+            // First sighting with nothing to restore, or an already restored
+            // window: keep the newest geometry so a later window of this app
+            // can be brought back, without touching this one.
+            None => {
+                if current.0.is_some() || current.1.is_some() {
+                    self.state
+                        .lock()
+                        .await
+                        .app_geometry
+                        .entry(app_id)
+                        .or_default()
+                        .insert(output, current);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The app id and output of a window, for geometry recall. Best effort:
@@ -1848,6 +1926,10 @@ impl BusinessLogic {
             None => {}
         }
 
+        // Floating geometry is remembered per app, and a new window of a known
+        // app (a reopened PiP) is put back where that app last floated.
+        self.maintain_geometry(id, floating).await?;
+
         self.persist().await;
         Ok(())
     }
@@ -1880,6 +1962,7 @@ impl BusinessLogic {
         state.staged_windows.remove(&window_id);
         state.auto_staged.remove(&window_id);
         state.marks.remove(&window_id);
+        state.restored_windows.remove(&window_id);
         state
             .scratchpad_slots
             .retain(|_, window| window.id != window_id);
@@ -1973,38 +2056,50 @@ impl BusinessLogic {
             .find(|window| window.id == window_id)
             .with_context(|| format!("Window {window_id} not found in Niri"))?;
 
-        if window.floating {
-            self.niri.tile_window(window_id).await?;
-            return Ok(false);
-        }
-
-        // Remember the tiled width so the next float restores it: niri
-        // reports no geometry worth keeping for tiled windows, but the
-        // app's per-output memory holds the last floating one.
         let output = match self.layout().await {
             Ok(layout) => window
                 .workspace_id
                 .and_then(|id| layout.output_of(id).map(String::from)),
             Err(e) => {
-                tracing::debug!("Cannot read the layout to place the remembered width: {e:#}");
+                tracing::debug!("Cannot read the layout to keep the floating geometry: {e:#}");
                 None
             }
         };
-        if let Some(app_id) = window.app_id.clone()
-            && let Some(size) = window.size
-        {
-            let mut state = self.state.lock().await;
-            let entry = state
-                .app_geometry
-                .entry(app_id)
-                .or_default()
-                .entry(output)
-                .or_insert((None, None));
-            if entry.0.is_none() {
-                entry.0 = Some(size);
+
+        if window.floating {
+            // Going tiled: keep where it was floating, so floating again
+            // restores the placement instead of niri's tiled default.
+            if let Some(app_id) = window.app_id.clone()
+                && (window.size.is_some() || window.position.is_some())
+            {
+                self.state
+                    .lock()
+                    .await
+                    .app_geometry
+                    .entry(app_id)
+                    .or_default()
+                    .insert(output, (window.size, window.position));
             }
+            self.niri.tile_window(window_id).await?;
+            return Ok(false);
         }
-        self.niri.float_window(window_id).await?;
+
+        // Going floating: put back what this app looked like the last time it
+        // floated on this output. A window that never floated falls back to
+        // the width niri reports for it tiled.
+        let mut remembered = self
+            .remembered_geometry(window.app_id.as_deref(), output.as_deref())
+            .await;
+        if remembered.0.is_none() {
+            remembered.0 = window.size;
+        }
+        if remembered.0.is_none() && remembered.1.is_none() {
+            self.niri.float_window(window_id).await?;
+        } else {
+            self.apply_geometry(window_id, remembered).await;
+        }
+        // The event that follows this move will not restore it a second time.
+        self.state.lock().await.restored_windows.insert(window_id);
         Ok(true)
     }
 
@@ -3457,6 +3552,149 @@ scratchpad-workspace = "drop"
         assert!(
             format!("{error:#}").contains("Window 99 not found"),
             "{error:#}"
+        );
+    }
+
+    /// The PiP use case: close the window, open it again, and it comes back
+    /// where it was, because the memory is per app and survives the new window
+    /// id. Nothing is applied on the very first sighting (nothing remembered).
+    #[tokio::test]
+    async fn test_a_reopened_pip_window_gets_its_remembered_geometry() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_windows(&[(1, "firefox", "Picture-in-Picture")]);
+        niri.set_window_floating(1, true);
+        niri.set_window_geometry(1, (480, 270), (1400.0, 750.0));
+
+        business
+            .handle_window_opened_or_changed(
+                1,
+                Some("firefox".into()),
+                Some("Picture-in-Picture".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            niri.window_actions().is_empty(),
+            "the first sighting is only recorded: {:?}",
+            niri.window_actions()
+        );
+
+        // Closed, then reopened under a new id, at niri's own default.
+        business.handle_window_closed(1).await.unwrap();
+        niri.set_windows(&[(2, "firefox", "Picture-in-Picture")]);
+        niri.set_window_floating(2, true);
+        niri.set_window_geometry(2, (800, 600), (0.0, 0.0));
+
+        business
+            .handle_window_opened_or_changed(
+                2,
+                Some("firefox".into()),
+                Some("Picture-in-Picture".into()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let actions = niri.window_actions();
+        assert!(
+            actions.contains(&"resize 2 width=480px height=270px".to_string()),
+            "the reopened window gets the remembered size: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"move 2 1400 750".to_string()),
+            "and the remembered position: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tiled_windows_are_never_given_floating_geometry() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_windows(&[(1, "firefox", "Picture-in-Picture")]);
+        niri.set_window_floating(1, true);
+        niri.set_window_geometry(1, (480, 270), (1400.0, 750.0));
+        business
+            .handle_window_opened_or_changed(1, Some("firefox".into()), None, true)
+            .await
+            .unwrap();
+        business.handle_window_closed(1).await.unwrap();
+
+        // The app opens a tiled window next: it must be left alone.
+        niri.set_windows(&[(2, "firefox", "Inbox")]);
+        business
+            .handle_window_opened_or_changed(2, Some("firefox".into()), Some("Inbox".into()), false)
+            .await
+            .unwrap();
+        assert!(
+            niri.window_actions().is_empty(),
+            "a tiled window is not floated or moved: {:?}",
+            niri.window_actions()
+        );
+    }
+
+    /// Once the remembered geometry has been applied, the user owns the
+    /// window: later resizes are recorded, not undone.
+    #[tokio::test]
+    async fn test_a_resize_after_the_restore_is_remembered_not_undone() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_windows(&[(1, "firefox", "Picture-in-Picture")]);
+        niri.set_window_floating(1, true);
+        niri.set_window_geometry(1, (480, 270), (1400.0, 750.0));
+        business
+            .handle_window_opened_or_changed(1, Some("firefox".into()), None, true)
+            .await
+            .unwrap();
+        business.handle_window_closed(1).await.unwrap();
+
+        niri.set_windows(&[(2, "firefox", "Picture-in-Picture")]);
+        niri.set_window_floating(2, true);
+        niri.set_window_geometry(2, (800, 600), (0.0, 0.0));
+        business
+            .handle_window_opened_or_changed(2, Some("firefox".into()), None, true)
+            .await
+            .unwrap();
+
+        // The user drags it to a new size and place; niri reports that.
+        niri.set_window_geometry(2, (500, 300), (10.0, 20.0));
+        business
+            .handle_window_opened_or_changed(2, Some("firefox".into()), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            business
+                .remembered_geometry(Some("firefox"), Some("DP-1"))
+                .await,
+            (Some((500, 300)), Some((10.0, 20.0))),
+            "the user's placement becomes the new memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toggle_floating_remembers_and_restores_the_geometry() {
+        let niri = with_layout();
+        niri.set_window_workspace(1, 1);
+        niri.set_window_floating(1, true);
+        niri.set_window_geometry(1, (1100, 480), (730.0, 94.0));
+        let business = business(&niri);
+        niri.set_active_window(1);
+
+        // Tiling keeps the floating placement...
+        assert!(!business.toggle_floating().await.unwrap());
+        // ...and floating again puts it back, instead of niri's default.
+        assert!(business.toggle_floating().await.unwrap());
+
+        let actions = niri.window_actions();
+        assert!(
+            actions.contains(&"resize 1 width=1100px height=480px".to_string()),
+            "the remembered size is applied: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"move 1 730 94".to_string()),
+            "the remembered position is applied: {actions:?}"
         );
     }
 
