@@ -2,7 +2,7 @@
 
 [![project check](https://github.com/fram446742/better-nsticky/actions/workflows/check.yml/badge.svg)](https://github.com/fram446742/better-nsticky/actions/workflows/check.yml)
 [![coverage](https://codecov.io/gh/fram446742/better-nsticky/branch/main/graph/badge.svg)](https://codecov.io/gh/fram446742/better-nsticky)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://github.com/fram446742/better-nsticky/blob/main/Cargo.toml)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange)](https://github.com/fram446742/better-nsticky/blob/main/Cargo.toml)
 
 A fork of [lonerOrz/nsticky](https://github.com/lonerOrz/nsticky) that stays a
 drop-in replacement: same `nsticky` binary, same `~/.config/nsticky`, same
@@ -49,7 +49,7 @@ without touching your configuration.
 
 ### From source
 
-Needs Rust 1.88 or newer (on Arch, install `rustup` and `rustup default stable`:
+Needs Rust 1.95 or newer (on Arch, install `rustup` and `rustup default stable`:
 the distro `rust` package *is* rustup, and nsticky uses let chains).
 
 ```bash
@@ -932,7 +932,7 @@ in CI:
 | niri | 26.04 |
 | Distribution | CachyOS (Arch-based) |
 | Kernel | 7.2.5 |
-| Rust | 1.88 or newer (local toolchain: 1.100.0-nightly) |
+| Rust | 1.95 or newer (local toolchain: 1.102.0-nightly) |
 | GPU driver | AMD Radeon RX 9070 (Mesa/amdgpu) |
 
 That covers the paths listed in [Development](#development) and the niri IPC

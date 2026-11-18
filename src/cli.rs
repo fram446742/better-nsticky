@@ -1502,6 +1502,21 @@ exclude-app-id = "steamwebhelper"
         );
     }
 
+    #[tokio::test]
+    async fn test_completions_are_written_to_stdout() {
+        let cli = Cli::try_parse_from(["nsticky", "completions", "bash"]).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        dispatch(cli, &Endpoints::from_env(), &mut out, &mut err)
+            .await
+            .unwrap();
+
+        let script = String::from_utf8(out).unwrap();
+        assert!(script.contains("nsticky"), "{script}");
+        assert!(err.is_empty());
+    }
+
     #[test]
     fn test_cli_reload() {
         let cli = Cli::try_parse_from(["nsticky", "reload"]).unwrap();

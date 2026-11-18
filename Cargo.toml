@@ -3,7 +3,7 @@
 name = "better-nsticky"
 version = "0.7.1"
 edition = "2024"
-# rust-version = "1.88"
+rust-version = "1.95"
 description = "Sticky and staged window management for the niri Wayland compositor (better-nsticky fork)"
 license = "BSD-3-Clause"
 repository = "https://github.com/fram446742/better-nsticky"

@@ -178,7 +178,7 @@ pub fn pin_target(
     pin_target_follow(pin, current_output, None, layout, focused_workspace, false)
 }
 
-/// [`pin_target`], plus the nirius `if-invisible` policy: with `on_hide`, a
+/// `pin_target` plus the nirius `if-invisible` policy: with `on_hide`, a
 /// window whose workspace is still the active one of its output stays put.
 /// Only once its workspace would be hidden does it follow the focus.
 pub fn pin_target_follow(

@@ -71,8 +71,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Setup Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Setup Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95
 
       # `rust-version` in Cargo.toml, so the README's claim is actually checked.
       - name: Cargo check

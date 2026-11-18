@@ -921,7 +921,7 @@ impl BusinessLogic {
                     })
                 })
                 .map(|window| window.id),
-            _ => Some(self.active_window_id().await?),
+            _ => self.active_window_id().await.ok(),
         };
 
         if let Some(window_id) = target {
@@ -971,6 +971,13 @@ impl BusinessLogic {
         output: Option<&str>,
     ) -> Result<String> {
         let _operation = self.operations.lock().await;
+        if self.state.lock().await.parked_stack.is_empty() {
+            bail!("Nothing to restore");
+        }
+
+        // Resolve the destination before taking an entry out: a bad
+        // `--workspace` must not lose the window.
+        let destination = self.destination_workspace(workspace, output).await?;
         let open: HashSet<u64> = self
             .windows()
             .await?
@@ -992,8 +999,6 @@ impl BusinessLogic {
         let Some(record) = record else {
             bail!("Nothing to restore");
         };
-
-        let destination = self.destination_workspace(workspace, output).await?;
         if let Err(e) = self.place_parked(&record, None, destination).await {
             self.state.lock().await.parked_stack.push(record);
             return Err(e);
@@ -3694,6 +3699,232 @@ scratchpad-workspace = "drop"
         assert_ne!(
             destination, parking_id,
             "a window restored while focus is on the parking area must not go back there"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toggle_drops_a_slot_whose_window_closed() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.toggle_scratchpad(None).await.unwrap();
+
+        // The parked window closed while it was hidden.
+        niri.set_windows(&[(2, "zen", "Browser")]);
+        niri.set_active_window(2);
+        let message = business.toggle_scratchpad(None).await.unwrap();
+
+        assert_eq!(message, "Hidden focused (2)");
+        assert!(parked(&business, 2).await);
+    }
+
+    #[tokio::test]
+    async fn test_toggle_reports_a_window_already_in_the_stack() {
+        let niri = with_layout();
+        let business = scratchpad_business(&niri).await;
+        niri.set_windows(&[(1, "foot", "dropdown-terminal")]);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        let message = business.toggle_scratchpad(Some("term")).await.unwrap();
+
+        assert_eq!(message, "Window 1 is already parked");
+    }
+
+    #[tokio::test]
+    async fn test_toggle_without_a_focused_window_reports_it() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.fail_next(Call::ActiveWindow);
+
+        let error = business.toggle_scratchpad(None).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "No window is focused");
+    }
+
+    #[tokio::test]
+    async fn test_restore_skips_a_stack_entry_that_closed() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+        niri.set_active_window(2);
+        business.add_scratchpad().await.unwrap();
+
+        niri.set_windows(&[(1, "foot", "Terminal")]);
+
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_reports_when_every_stack_entry_closed() {
+        let niri = with_layout();
+        let business = business(&niri);
+        business
+            .state
+            .lock()
+            .await
+            .parked_stack
+            .push(ScratchpadWindow {
+                id: 99,
+                was_sticky: false,
+                pin: Vec::new(),
+                floating: Some(false),
+                size: None,
+                position: None,
+            });
+
+        let error = business.restore_scratchpad(None, None).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Nothing to restore");
+        assert!(business.state.lock().await.parked_stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_window_position_is_none_when_the_query_fails() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.fail_next(Call::Windows);
+
+        assert_eq!(business.window_position(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_restore_keeps_the_window_when_the_move_fails() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        niri.fail_move(1);
+        let error = business.restore_scratchpad(None, None).await.unwrap_err();
+
+        assert!(error.to_string().contains("refused to move"), "{error}");
+        assert!(parked(&business, 1).await);
+    }
+
+    #[tokio::test]
+    async fn test_restore_accepts_an_output() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (2, "stage", "DP-1"),
+            (3, "", "DP-1"),
+            (4, "two", "DP-2"),
+            (5, "", "DP-2"),
+        ]);
+        niri.set_workspace_active(1, true);
+        niri.set_active_workspace(1);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        niri.set_workspace_active(1, false);
+        niri.set_workspace_active(4, true);
+        business
+            .restore_scratchpad(None, Some("DP-2"))
+            .await
+            .unwrap();
+
+        assert_eq!(niri.moves().last().unwrap(), &(1, 4));
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_an_unknown_target_without_losing_the_window() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        let error = business
+            .restore_scratchpad(Some("nope"), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("No workspace"), "{error}");
+
+        let error = business
+            .restore_scratchpad(None, Some("DP-9"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("No active workspace"), "{error}");
+        assert!(parked(&business, 1).await);
+    }
+
+    #[tokio::test]
+    async fn test_restore_falls_back_to_another_output_when_focus_has_no_workspace() {
+        let niri = with_layout();
+        let business = business_with_config(&niri, "stage-keep-workspace = true\n");
+        niri.set_workspaces(&[
+            (1, "scratchpad", "DP-1"),
+            (2, "stage", "DP-1"),
+            (3, "one", "DP-2"),
+            (4, "", "DP-2"),
+        ]);
+        niri.set_workspace_active(3, true);
+        niri.set_active_workspace(3);
+        niri.set_active_window(1);
+        niri.set_window_workspace(1, 3);
+        business.add_scratchpad().await.unwrap();
+
+        niri.set_workspace_focused(1);
+        niri.set_workspace_active(3, false);
+        niri.set_workspace_active(1, true);
+        niri.set_active_workspace(1);
+        business.restore_scratchpad(None, None).await.unwrap();
+
+        assert_eq!(niri.moves().last().unwrap(), &(1, 3));
+    }
+
+    #[tokio::test]
+    async fn test_a_floating_window_without_geometry_uses_the_configured_size() {
+        let niri = with_layout();
+        let business = scratchpad_business(&niri).await;
+        niri.set_windows(&[(1, "foot", "dropdown-terminal")]);
+        niri.set_window_floating(1, true);
+
+        business.toggle_scratchpad(Some("term")).await.unwrap();
+        business.toggle_scratchpad(Some("term")).await.unwrap();
+
+        assert_eq!(
+            niri.window_actions(),
+            vec![
+                "float 1".to_string(),
+                "resize 1 width=60% height=400px".to_string(),
+                "focus 1".to_string(),
+            ],
+            "floating without geometry falls back to the configured size"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_old_saved_slot_without_floating_state_still_shows() {
+        let niri = with_layout();
+        let storage = Arc::new(MemoryStorage::default());
+        let business = business_with_storage(&niri, "", &storage);
+        niri.set_windows(&[(1, "foot", "dropdown-terminal")]);
+
+        let mut state = StoredState::new(Vec::new(), Vec::new());
+        state.scratchpad_toggle = Some(StoredScratchpad::Full {
+            id: 1,
+            was_sticky: false,
+            outputs: Vec::new(),
+            size: None,
+            position: None,
+            floating: None,
+        });
+        storage.save(&state).unwrap();
+        business.reconcile().await.unwrap();
+
+        let message = business.toggle_scratchpad(None).await.unwrap();
+
+        assert_eq!(message, "Shown focused (1)");
+        assert!(
+            niri.window_actions()
+                .iter()
+                .any(|action| action == "float 1")
         );
     }
 
