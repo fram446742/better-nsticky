@@ -511,4 +511,38 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_retries_a_script_that_is_still_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nsticky-menu-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("selector");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An open writer makes execve report ETXTBSY; release it while spawn retries.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(writer);
+        });
+
+        let menu = MenuSpec::Args(vec![script.display().to_string()])
+            .parse()
+            .unwrap();
+        let mut child = menu
+            .spawn()
+            .expect("spawn retries while the script is busy");
+        child.wait().unwrap();
+        release.join().unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
