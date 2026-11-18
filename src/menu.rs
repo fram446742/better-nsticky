@@ -189,18 +189,30 @@ impl MenuCommand {
     /// Spawn the selector with the window list on its stdin and its stdout
     /// piped back; stderr is inherited.
     pub fn spawn(&self) -> Result<Child> {
-        Command::new(&self.program)
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to launch menu:\n\n{}\n\nerror:\n    {e}",
-                    self.describe()
-                )
-            })
+        let mut busy = 0;
+        loop {
+            match Command::new(&self.program)
+                .args(&self.args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => return Ok(child),
+                // A script written just before launch can still be open in a
+                // forked child; the kernel reports ETXTBSY for a moment.
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 20 => {
+                    busy += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Failed to launch menu:\n\n{}\n\nerror:\n    {e}",
+                        self.describe()
+                    ));
+                }
+            }
+        }
     }
 }
 
