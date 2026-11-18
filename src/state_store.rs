@@ -64,6 +64,9 @@ pub enum StoredScratchpad {
         size: Option<(i32, i32)>,
         #[serde(default)]
         position: Option<(f64, f64)>,
+        /// Floating state when parked. Missing in files from older versions.
+        #[serde(default)]
+        floating: Option<bool>,
     },
 }
 
@@ -75,6 +78,7 @@ pub struct ScratchpadRecord {
     pub outputs: Vec<String>,
     pub size: Option<(i32, i32)>,
     pub position: Option<(f64, f64)>,
+    pub floating: Option<bool>,
 }
 
 impl StoredScratchpad {
@@ -90,12 +94,14 @@ impl StoredScratchpad {
                 outputs,
                 size,
                 position,
+                floating,
             } => ScratchpadRecord {
                 id,
                 was_sticky,
                 outputs,
                 size,
                 position,
+                floating,
             },
         }
     }
@@ -131,9 +137,15 @@ pub struct StoredState {
     pub version: u32,
     pub sticky: Vec<StoredSticky>,
     pub staged: Vec<StoredStaged>,
-    /// Scratchpad name to the window it parked.
+    /// Configured scratchpad name to the window it parked.
     #[serde(default)]
     pub scratchpads: std::collections::BTreeMap<String, StoredScratchpad>,
+    /// `scratchpad add` stack, oldest first.
+    #[serde(default)]
+    pub scratchpad_stack: Vec<StoredScratchpad>,
+    /// Window owned by `scratchpad toggle`.
+    #[serde(default)]
+    pub scratchpad_toggle: Option<StoredScratchpad>,
 }
 
 impl StoredState {
@@ -143,6 +155,8 @@ impl StoredState {
             sticky,
             staged,
             scratchpads: std::collections::BTreeMap::new(),
+            scratchpad_stack: Vec::new(),
+            scratchpad_toggle: None,
         }
     }
 }
@@ -455,6 +469,37 @@ mod tests {
     }
 
     #[test]
+    fn test_state_keeps_the_stack_toggle_and_floating_state() {
+        let path = temp_path();
+        let storage = FileStorage::new(path.clone());
+        let record = |id, floating| StoredScratchpad::Full {
+            id,
+            was_sticky: false,
+            outputs: Vec::new(),
+            size: None,
+            position: None,
+            floating: Some(floating),
+        };
+
+        let mut state = StoredState::new(Vec::new(), Vec::new());
+        state.scratchpad_stack = vec![record(1, false), record(2, true)];
+        state.scratchpad_toggle = Some(record(3, true));
+        storage.save(&state).unwrap();
+
+        let loaded = storage.load().unwrap().unwrap();
+        assert_eq!(loaded.scratchpad_stack.len(), 2);
+        assert_eq!(
+            loaded.scratchpad_stack[0].clone().into_record().floating,
+            Some(false)
+        );
+        assert_eq!(
+            loaded.scratchpad_toggle.unwrap().into_record().floating,
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn test_bare_ids_from_older_state_files_still_load() {
         let path = temp_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -723,6 +768,7 @@ mod tests {
             outputs: vec!["DP-2".to_string()],
             size: Some((1200, 600)),
             position: Some((12.0, 34.0)),
+            floating: Some(true),
         };
 
         let mut state = StoredState::new(Vec::new(), Vec::new());
@@ -734,6 +780,7 @@ mod tests {
                 outputs: record.outputs.clone(),
                 size: record.size,
                 position: record.position,
+                floating: record.floating,
             },
         );
         storage.save(&state).unwrap();

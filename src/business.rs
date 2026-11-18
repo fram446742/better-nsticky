@@ -1,9 +1,8 @@
-//! Sticky/staged window bookkeeping and request orchestration.
+//! Window bookkeeping and request handling.
 //!
-//! [`BusinessLogic`] owns the daemon's in-memory state: which windows are
-//! sticky, which are parked on the stage workspace. Every move goes through
-//! [`Niri`], and state is committed only once the compositor accepted it, so a
-//! failed move leaves nothing to undo.
+//! [`BusinessLogic`] owns the daemon state: sticky windows, the stage, and the
+//! scratchpad areas. Every move goes through [`Niri`], and state is committed
+//! only after the compositor accepts it.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
@@ -15,7 +14,9 @@ use crate::config::{Config, Scratchpad, StickyFollow, WindowAction, WindowFacts}
 use crate::niri::{Niri, Size, WindowInfo};
 use crate::pinning::{Layout, parking_order_moves, pin_target_follow};
 use crate::protocol::{Request, Response};
-use crate::state_store::{StateStorage, StoredScratchpad, StoredStaged, StoredState, StoredSticky};
+use crate::state_store::{
+    ScratchpadRecord, StateStorage, StoredScratchpad, StoredStaged, StoredState, StoredSticky,
+};
 
 /// A window parked on the stage workspace.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,36 +77,59 @@ struct ScratchpadWindow {
     id: u64,
     was_sticky: bool,
     pin: Vec<String>,
+    /// Floating state it had before being parked; `None` in state written by
+    /// older versions.
+    floating: Option<bool>,
     size: Option<(i32, i32)>,
     position: Option<(f64, f64)>,
+}
+
+impl ScratchpadWindow {
+    fn stored(&self) -> StoredScratchpad {
+        StoredScratchpad::Full {
+            id: self.id,
+            was_sticky: self.was_sticky,
+            outputs: self.pin.clone(),
+            size: self.size,
+            position: self.position,
+            floating: self.floating,
+        }
+    }
+
+    fn from_record(record: ScratchpadRecord) -> Self {
+        Self {
+            id: record.id,
+            was_sticky: record.was_sticky,
+            pin: record.outputs,
+            floating: record.floating,
+            size: record.size,
+            position: record.position,
+        }
+    }
 }
 
 #[derive(Default)]
 struct AppState {
     sticky_windows: HashMap<u64, StickyWindow>,
     staged_windows: HashMap<u64, StagedWindow>,
-    /// Window each scratchpad parked, so the same key shows it again.
+    /// `scratchpad add` stack, oldest first; `restore` pops the last entry.
+    parked_stack: Vec<ScratchpadWindow>,
+    /// Window owned by `scratchpad toggle`.
+    toggled_window: Option<ScratchpadWindow>,
+    /// Configured scratchpad name to the window it owns.
     scratchpad_slots: std::collections::BTreeMap<String, ScratchpadWindow>,
-    /// Windows a `[stage.*]` rule already parked in this daemon run, so an
-    /// explicit restore is not undone by the next event the window emits.
+    /// Windows a `[stage.*]` rule already parked, so a later event does not
+    /// stage them again.
     auto_staged: HashSet<u64>,
-    /// Last floating geometry per app and output, kept only in memory: a
-    /// PiP-style window comes back at the size and position it had, until
-    /// the daemon (or the machine) restarts. Never persisted. One entry
-    /// per monitor, so a video window keeps its placement on each output.
-    /// Keyed by app first, so a lookup is one hash and the across-outputs
-    /// fallback only walks that app's handful of monitor entries.
+    /// Floating geometry per app and output, in memory only: a reopened window
+    /// of the same app comes back where it last floated.
     app_geometry: HashMap<String, HashMap<Option<String>, FloatingGeometry>>,
-    /// Window labels (`nsticky mark`), memory only like geometry: gone on
-    /// restart. nirius `toggle-mark` port without the toggle: explicit
-    /// `mark`/`unmark` verbs, listed by `marks`.
+    /// `nsticky mark` labels, lost when the daemon restarts.
     marks: HashMap<u64, String>,
-    /// Whether niri's overview is open. While it is, the strip must not be
-    /// reordered: the user is looking straight at it.
+    /// Reordering the parking areas while niri's overview is open would move
+    /// the strip the user is looking at.
     overview_open: bool,
-    /// Windows whose remembered geometry was already applied in this run, so a
-    /// later event from the same window does not snap it back while the user
-    /// is resizing it.
+    /// Geometry already applied, so a later event does not undo a resize.
     restored_windows: HashSet<u64>,
 }
 
@@ -117,12 +141,10 @@ pub struct BusinessLogic {
     config_path: Arc<PathBuf>,
     niri: Arc<dyn Niri>,
     storage: Arc<dyn StateStorage>,
-    /// Last state handed to the storage, so unchanged state is not rewritten
-    /// (window events fire on every title change).
+    /// Last state written, to skip rewrites when nothing changed.
     persisted: Arc<Mutex<Option<StoredState>>>,
-    /// Held for the duration of a command or an event: an operation reads the
-    /// compositor, changes state and moves windows, and two of them at once
-    /// would interleave those steps.
+    /// Serializes commands and events: each one reads the compositor, changes
+    /// state and moves windows, and two at once would interleave those steps.
     operations: Arc<Mutex<()>>,
 }
 
@@ -152,19 +174,14 @@ impl AppState {
         state.scratchpads = self
             .scratchpad_slots
             .iter()
-            .map(|(label, window)| {
-                (
-                    label.clone(),
-                    StoredScratchpad::Full {
-                        id: window.id,
-                        was_sticky: window.was_sticky,
-                        outputs: window.pin.clone(),
-                        size: window.size,
-                        position: window.position,
-                    },
-                )
-            })
+            .map(|(label, window)| (label.clone(), window.stored()))
             .collect();
+        state.scratchpad_stack = self
+            .parked_stack
+            .iter()
+            .map(ScratchpadWindow::stored)
+            .collect();
+        state.scratchpad_toggle = self.toggled_window.as_ref().map(ScratchpadWindow::stored);
         state
     }
 
@@ -179,20 +196,16 @@ impl AppState {
         self.scratchpad_slots = stored
             .scratchpads
             .into_iter()
-            .map(|(label, window)| {
-                let record = window.into_record();
-                (
-                    label,
-                    ScratchpadWindow {
-                        id: record.id,
-                        was_sticky: record.was_sticky,
-                        pin: record.outputs,
-                        size: record.size,
-                        position: record.position,
-                    },
-                )
-            })
+            .map(|(label, window)| (label, ScratchpadWindow::from_record(window.into_record())))
             .collect();
+        self.parked_stack = stored
+            .scratchpad_stack
+            .into_iter()
+            .map(|window| ScratchpadWindow::from_record(window.into_record()))
+            .collect();
+        self.toggled_window = stored
+            .scratchpad_toggle
+            .map(|window| ScratchpadWindow::from_record(window.into_record()));
         self.staged_windows = stored
             .staged
             .into_iter()
@@ -228,6 +241,21 @@ fn reply_json<T: serde::Serialize>(result: Result<T>) -> Response {
         },
         Err(e) => Response::error(e),
     }
+}
+
+/// A configured scratchpad by name, with the message shown when it is missing.
+fn configured_scratchpad(config: &Config, name: &str) -> Result<Scratchpad> {
+    let Some(scratchpad) = config.scratchpad(name) else {
+        let known = config.scratchpad_names();
+        if known.is_empty() {
+            bail!("No [scratchpad.{name}] is configured");
+        }
+        bail!(
+            "Unknown scratchpad {name:?}; configured: {}",
+            known.join(", ")
+        );
+    };
+    Ok(scratchpad.clone())
 }
 
 /// Sizes are the same shape on both sides, only the types differ.
@@ -390,9 +418,22 @@ impl BusinessLogic {
 
         // Stored state supplies the sticky list, its output pins and the "was
         // sticky before being staged" memory, which the compositor cannot know.
-        let (stored_sticky, stored_entries, stored_pads) = match stored {
-            Some(stored) => (stored.sticky, stored.staged, stored.scratchpads),
-            None => (Vec::new(), Vec::new(), std::collections::BTreeMap::new()),
+        let (stored_sticky, stored_entries, stored_pads, stored_stack, stored_toggle) = match stored
+        {
+            Some(stored) => (
+                stored.sticky,
+                stored.staged,
+                stored.scratchpads,
+                stored.scratchpad_stack,
+                stored.scratchpad_toggle,
+            ),
+            None => (
+                Vec::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+                None,
+            ),
         };
 
         sticky.extend(
@@ -410,24 +451,26 @@ impl BusinessLogic {
                 .map(|entry| (entry.id, entry)),
         );
 
-        // Scratchpads keep the label of the slot they belong to, which only the
-        // file knows; a window that is gone takes its slot with it.
-        let scratchpads: std::collections::BTreeMap<String, ScratchpadWindow> = stored_pads
+        // Which slot a window belongs to only exists in the file. A window that
+        // is gone takes its slot with it, and a window listed twice stays in
+        // the first area that claims it.
+        // Older versions stored the unnamed toggle under this name.
+        let mut stored_pads = stored_pads;
+        let stored_toggle = stored_toggle.or_else(|| stored_pads.remove("focused"));
+        let mut claimed = HashSet::new();
+        let mut scratchpad_slots = std::collections::BTreeMap::new();
+        for (label, window) in stored_pads {
+            if exists(window.id()) && claimed.insert(window.id()) {
+                scratchpad_slots.insert(label, ScratchpadWindow::from_record(window.into_record()));
+            }
+        }
+        let toggled_window = stored_toggle
+            .filter(|window| exists(window.id()) && claimed.insert(window.id()))
+            .map(|window| ScratchpadWindow::from_record(window.into_record()));
+        let parked_stack: Vec<ScratchpadWindow> = stored_stack
             .into_iter()
-            .filter(|(_, window)| exists(window.id()))
-            .map(|(label, window)| {
-                let record = window.into_record();
-                (
-                    label,
-                    ScratchpadWindow {
-                        id: record.id,
-                        was_sticky: record.was_sticky,
-                        pin: record.outputs,
-                        size: record.size,
-                        position: record.position,
-                    },
-                )
-            })
+            .filter(|window| exists(window.id()) && claimed.insert(window.id()))
+            .map(|window| ScratchpadWindow::from_record(window.into_record()))
             .collect();
 
         match &on_stage {
@@ -467,19 +510,22 @@ impl BusinessLogic {
 
         // A window is either sticky, staged or parked by a scratchpad.
         let staged_ids: HashSet<u64> = staged.keys().copied().collect();
-        let pad_ids: HashSet<u64> = scratchpads.values().map(|window| window.id).collect();
-        sticky.retain(|id, _| !staged_ids.contains(id) && !pad_ids.contains(id));
-        staged.retain(|id, _| !pad_ids.contains(id));
+        sticky.retain(|id, _| !staged_ids.contains(id) && !claimed.contains(id));
+        staged.retain(|id, _| !claimed.contains(id));
 
         let (sticky_count, staged_count, pad_count) = {
             let mut state = self.state.lock().await;
             state.sticky_windows = sticky;
             state.staged_windows = staged;
-            state.scratchpad_slots = scratchpads;
+            state.scratchpad_slots = scratchpad_slots;
+            state.toggled_window = toggled_window;
+            state.parked_stack = parked_stack;
             (
                 state.sticky_windows.len(),
                 state.staged_windows.len(),
-                state.scratchpad_slots.len(),
+                state.scratchpad_slots.len()
+                    + usize::from(state.toggled_window.is_some())
+                    + state.parked_stack.len(),
             )
         };
 
@@ -818,72 +864,81 @@ impl BusinessLogic {
         (app_id, output)
     }
 
-    /// Toggle a scratchpad.
-    ///
-    /// A configured scratchpad toggles its own window; one without matching
-    /// fields, and `nsticky scratchpad` with no name, toggle whatever has
-    /// focus. A second press brings back the window it parked, with its size
-    /// and position; with nothing to show, the configured command is started.
+    /// Toggle a configured scratchpad, or the unnamed toggle slot.
+    #[cfg(test)]
     pub async fn toggle_scratchpad(&self, name: Option<&str>) -> Result<String> {
-        let _operation = self.operations.lock().await;
+        self.toggle_scratchpad_to(name, None, None).await
+    }
 
-        let (scratchpad, label) = {
-            let config = self.config().await;
+    /// Toggle a scratchpad and show its window on the requested workspace.
+    pub async fn toggle_scratchpad_to(
+        &self,
+        name: Option<&str>,
+        workspace: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<String> {
+        let _operation = self.operations.lock().await;
+        let config = self.config().await;
+        let scratchpad = match name {
+            Some(name) => Some(configured_scratchpad(&config, name)?),
+            None => None,
+        };
+        let label = name.unwrap_or("focused");
+        let windows = self.windows().await?;
+
+        // The window this slot owns wins over focus, which is what makes the
+        // key a toggle rather than a second way to park something.
+        let parked = {
+            let state = self.state.lock().await;
             match name {
-                Some(name) => {
-                    let Some(scratchpad) = config.scratchpad(name) else {
-                        let known = config.scratchpad_names();
-                        if known.is_empty() {
-                            bail!("No [scratchpad.{name}] is configured");
-                        }
-                        bail!(
-                            "Unknown scratchpad {name:?}; configured: {}",
-                            known.join(", ")
-                        );
-                    };
-                    (Some(scratchpad.clone()), name.to_string())
-                }
-                // No name: the focused window, no configuration needed.
-                None => (None, "focused".to_string()),
+                Some(name) => state.scratchpad_slots.get(name).cloned(),
+                None => state.toggled_window.clone(),
             }
         };
-
-        // A window this scratchpad parked before comes back, even when another
-        // window has focus now: that is what makes it a toggle.
-        if let Some(window_id) = self.scratchpad_window(&label).await {
-            self.show_scratchpad(scratchpad.as_ref(), &label, window_id)
-                .await?;
-            return Ok(format!("Shown {label} ({window_id})"));
+        if let Some(record) = parked {
+            if windows.iter().any(|window| window.id == record.id) {
+                let destination = self.destination_workspace(workspace, output).await?;
+                self.place_parked(&record, scratchpad.as_ref(), destination)
+                    .await?;
+                self.forget_parked(name, record.id).await;
+                self.release_scratchpad_workspace().await;
+                self.persist().await;
+                self.niri.focus_window(record.id).await?;
+                return Ok(format!("Shown {label} ({})", record.id));
+            }
+            // The window closed behind our back: drop the stale slot.
+            self.forget_parked(name, record.id).await;
         }
 
-        // Otherwise the configured window, or whatever is focused.
         let target = match &scratchpad {
-            Some(scratchpad) if !scratchpad.follows_focus() => {
-                let windows = self.windows().await?;
-                windows
-                    .iter()
-                    .find(|window| {
-                        scratchpad.matches(&WindowFacts {
-                            app_id: window.app_id.as_deref(),
-                            title: window.title.as_deref(),
-                            floating: window.floating,
-                        })
+            Some(scratchpad) if !scratchpad.follows_focus() => windows
+                .iter()
+                .find(|window| {
+                    scratchpad.matches(&WindowFacts {
+                        app_id: window.app_id.as_deref(),
+                        title: window.title.as_deref(),
+                        floating: window.floating,
                     })
-                    .map(|window| window.id)
-            }
+                })
+                .map(|window| window.id),
             _ => Some(self.active_window_id().await?),
         };
 
-        // Park it on the scratchpad workspace, remembering where it was and how
-        // big it was. A window parked on the stage by hand is taken over here:
-        // one window belongs to one parking area, and the stage would otherwise
-        // bring back a window the scratchpad owns.
         if let Some(window_id) = target {
-            self.hide_scratchpad(&label, window_id).await?;
+            if self.parked_area(window_id).await.is_some() {
+                return Ok(format!("Window {window_id} is already parked"));
+            }
+            let record = self.park_window(window_id).await?;
+            let mut state = self.state.lock().await;
+            match name {
+                Some(name) => state.scratchpad_slots.insert(name.to_string(), record),
+                None => state.toggled_window.replace(record),
+            };
+            drop(state);
+            self.persist().await;
             return Ok(format!("Hidden {label} ({window_id})"));
         }
 
-        // Nothing to toggle: start the configured command, if any.
         let Some(scratchpad) = scratchpad else {
             bail!("No window is focused");
         };
@@ -892,6 +947,61 @@ impl BusinessLogic {
         };
         self.niri.spawn(command).await?;
         Ok(format!("Starting {label} ({})", command.join(" ")))
+    }
+
+    /// Park the focused window; `scratchpad restore` brings it back (LIFO).
+    pub async fn add_scratchpad(&self) -> Result<String> {
+        let _operation = self.operations.lock().await;
+        let window_id = self.active_window_id().await?;
+
+        if self.parked_area(window_id).await.is_some() {
+            return Ok(format!("Window {window_id} is already parked"));
+        }
+
+        let record = self.park_window(window_id).await?;
+        self.state.lock().await.parked_stack.push(record);
+        self.persist().await;
+        Ok(format!("Parked {window_id}"))
+    }
+
+    /// Bring back the most recently parked window.
+    pub async fn restore_scratchpad(
+        &self,
+        workspace: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<String> {
+        let _operation = self.operations.lock().await;
+        let open: HashSet<u64> = self
+            .windows()
+            .await?
+            .iter()
+            .map(|window| window.id)
+            .collect();
+
+        let record = {
+            let mut state = self.state.lock().await;
+            let mut found = None;
+            while let Some(record) = state.parked_stack.pop() {
+                if open.contains(&record.id) {
+                    found = Some(record);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(record) = record else {
+            bail!("Nothing to restore");
+        };
+
+        let destination = self.destination_workspace(workspace, output).await?;
+        if let Err(e) = self.place_parked(&record, None, destination).await {
+            self.state.lock().await.parked_stack.push(record);
+            return Err(e);
+        }
+        self.release_scratchpad_workspace().await;
+        self.persist().await;
+        self.niri.focus_window(record.id).await?;
+        Ok(format!("Restored {}", record.id))
     }
 
     /// Where a window currently is, if niri reports it.
@@ -904,190 +1014,266 @@ impl BusinessLogic {
             .and_then(|window| window.position)
     }
 
-    /// Window this scratchpad parked, if it is still parked.
-    async fn scratchpad_window(&self, label: &str) -> Option<u64> {
-        let window_id = {
-            let state = self.state.lock().await;
-            state.scratchpad_slots.get(label).map(|window| window.id)
-        }?;
-
-        if self.is_scratchpad_window(window_id).await {
-            return Some(window_id);
-        }
-
-        self.state.lock().await.scratchpad_slots.remove(label);
-        None
-    }
-
-    /// Whether a window is parked by some scratchpad.
-    async fn is_scratchpad_window(&self, window_id: u64) -> bool {
+    /// Which scratchpad area owns a window, if any.
+    async fn parked_area(&self, window_id: u64) -> Option<&'static str> {
         let state = self.state.lock().await;
-        state
+        if state
+            .parked_stack
+            .iter()
+            .any(|window| window.id == window_id)
+        {
+            return Some("stack");
+        }
+        if state
+            .toggled_window
+            .as_ref()
+            .is_some_and(|window| window.id == window_id)
+        {
+            return Some("toggle slot");
+        }
+        if state
             .scratchpad_slots
             .values()
             .any(|window| window.id == window_id)
+        {
+            return Some("configured scratchpad");
+        }
+        None
     }
 
-    /// Park a window on the scratchpad workspace, remembering how it was.
-    async fn hide_scratchpad(&self, label: &str, window_id: u64) -> Result<()> {
+    /// Release the slot `name` owns, if it still holds this window.
+    async fn forget_parked(&self, name: Option<&str>, window_id: u64) {
+        let mut state = self.state.lock().await;
+        match name {
+            Some(name) => {
+                if state
+                    .scratchpad_slots
+                    .get(name)
+                    .is_some_and(|window| window.id == window_id)
+                {
+                    state.scratchpad_slots.remove(name);
+                }
+            }
+            None => {
+                if state
+                    .toggled_window
+                    .as_ref()
+                    .is_some_and(|window| window.id == window_id)
+                {
+                    state.toggled_window = None;
+                }
+            }
+        }
+    }
+
+    /// Move a window to the scratchpad workspace and remember how it was.
+    async fn park_window(&self, window_id: u64) -> Result<ScratchpadWindow> {
         self.ensure_window_exists(window_id).await?;
         let (size, position) = self.capture_geometry(window_id).await;
+        let floating = self.window_floating(window_id).await;
 
-        // Take it out of the stage if it happened to be parked there, keeping
-        // what the stage knew about it.
-        let record = {
-            let mut state = self.state.lock().await;
-            let staged = state.staged_windows.remove(&window_id);
-            let sticky = state.sticky_windows.remove(&window_id);
-
-            let (was_sticky, pin, staged_size, staged_position) = match staged {
-                Some(staged) => (staged.was_sticky, staged.pin, staged.size, staged.position),
-                None => (
-                    sticky.is_some(),
-                    sticky.map(|sticky| sticky.pin).unwrap_or_default(),
-                    None,
-                    None,
+        // A window parked on the stage keeps what the stage knew about it.
+        let (was_sticky, pin, staged_size, staged_position) = {
+            let state = self.state.lock().await;
+            match state.staged_windows.get(&window_id) {
+                Some(staged) => (
+                    staged.was_sticky,
+                    staged.pin.clone(),
+                    staged.size,
+                    staged.position,
                 ),
-            };
-
-            ScratchpadWindow {
-                id: window_id,
-                was_sticky,
-                pin,
-                size: staged_size.or(size),
-                position: staged_position.or(position),
+                None => match state.sticky_windows.get(&window_id) {
+                    Some(sticky) => (true, sticky.pin.clone(), None, None),
+                    None => (false, Vec::new(), None, None),
+                },
             }
         };
 
         let name = self.scratchpad_workspace_name().await;
         let workspace = self.parking_workspace_for(&name, window_id).await?;
+        self.niri.move_window(window_id, workspace).await?;
 
-        if let Err(e) = self.niri.move_window(window_id, workspace).await {
-            // Roll back: it stays where it was.
-            let mut state = self.state.lock().await;
-            if record.was_sticky {
-                state.sticky_windows.insert(
-                    window_id,
-                    StickyWindow {
-                        pin: record.pin.clone(),
-                    },
-                );
-            }
-            return Err(e);
-        }
-
-        self.state
-            .lock()
-            .await
-            .scratchpad_slots
-            .insert(label.to_string(), record);
+        let mut state = self.state.lock().await;
+        state.staged_windows.remove(&window_id);
+        state.sticky_windows.remove(&window_id);
+        drop(state);
 
         // The stage may have lost its last window to this scratchpad.
         let stage_name = self.stage_workspace_name().await;
         self.release_parking_workspace(&stage_name, "a scratchpad took its window over")
             .await;
 
-        self.persist().await;
-        Ok(())
+        Ok(ScratchpadWindow {
+            id: window_id,
+            was_sticky,
+            pin,
+            floating: Some(floating),
+            size: staged_size.or(size),
+            position: staged_position.or(position),
+        })
     }
 
-    /// Bring a parked window back to the focused workspace: floating, with the
-    /// geometry it had, and focused.
-    async fn show_scratchpad(
+    /// Whether niri currently reports a window as floating.
+    async fn window_floating(&self, window_id: u64) -> bool {
+        self.windows()
+            .await
+            .map(|windows| {
+                windows
+                    .iter()
+                    .any(|window| window.id == window_id && window.floating)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Workspace a restored window goes to.
+    ///
+    /// Defaults to the focused workspace, falling back to the nearest ordinary
+    /// one when focus is on a parking area. `workspace` takes an id or a name,
+    /// and `output` narrows either choice to one output.
+    async fn destination_workspace(
         &self,
-        scratchpad: Option<&Scratchpad>,
-        label: &str,
-        window_id: u64,
-    ) -> Result<()> {
-        let record = {
-            let mut state = self.state.lock().await;
-            state.scratchpad_slots.remove(label)
+        workspace: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<u64> {
+        let workspaces = self.niri.workspaces().await?;
+        let parking = [
+            self.stage_workspace_name().await,
+            self.scratchpad_workspace_name().await,
+        ];
+        let ordinary = |workspace: &&crate::niri::WorkspaceInfo| {
+            !workspace
+                .name
+                .as_deref()
+                .is_some_and(|name| parking.iter().any(|area| area == name))
         };
-        let (mut remembered_size, mut remembered_position) = record
-            .as_ref()
-            .map(|record| (record.size, record.position))
-            .unwrap_or((None, None));
-        // No per-window geometry (window opened while parked, or an older
-        // state file): fall back to what this app looked like the last time
-        // it was visible in this daemon run.
-        if remembered_size.is_none() && remembered_position.is_none() {
-            let (app_id, output) = self.geometry_context(window_id).await;
-            (remembered_size, remembered_position) = self
+
+        if let Some(target) = workspace {
+            let id = target.parse::<u64>().ok();
+            let found = workspaces
+                .iter()
+                .filter(|workspace| {
+                    (id.is_some_and(|id| workspace.id == id)
+                        || workspace.name.as_deref() == Some(target))
+                        && output.is_none_or(|output| workspace.output.as_deref() == Some(output))
+                })
+                .max_by_key(|workspace| workspace.is_focused);
+            return found
+                .map(|workspace| workspace.id)
+                .with_context(|| format!("No workspace {target:?} to restore on"));
+        }
+
+        if let Some(output) = output {
+            return workspaces
+                .iter()
+                .find(|workspace| {
+                    workspace.output.as_deref() == Some(output) && workspace.is_active
+                })
+                .map(|workspace| workspace.id)
+                .with_context(|| format!("No active workspace on output {output:?}"));
+        }
+
+        let focused = workspaces.iter().find(|workspace| workspace.is_focused);
+        if let Some(workspace) = focused.filter(ordinary) {
+            return Ok(workspace.id);
+        }
+
+        let output = focused.and_then(|workspace| workspace.output.as_deref());
+        workspaces
+            .iter()
+            .filter(|workspace| {
+                ordinary(workspace)
+                    && output.is_none_or(|output| workspace.output.as_deref() == Some(output))
+            })
+            .max_by_key(|workspace| workspace.idx)
+            .or_else(|| workspaces.iter().find(ordinary))
+            .map(|workspace| workspace.id)
+            .context("No workspace available to restore the window on")
+    }
+
+    /// Move a parked window to `destination` and restore how it looked.
+    async fn place_parked(
+        &self,
+        record: &ScratchpadWindow,
+        scratchpad: Option<&Scratchpad>,
+        destination: u64,
+    ) -> Result<()> {
+        // A tiled window stays tiled; only a floating one gets a size and a
+        // position back. `floating` is absent in state from older versions.
+        let floating = record
+            .floating
+            .unwrap_or_else(|| scratchpad.is_none_or(|scratchpad| scratchpad.float));
+
+        let (mut size, mut position) = (record.size, record.position);
+        if floating && size.is_none() && position.is_none() {
+            let (app_id, output) = self.geometry_context(record.id).await;
+            (size, position) = self
                 .remembered_geometry(app_id.as_deref(), output.as_deref())
                 .await;
         }
 
-        let workspace_id = self.active_workspace_id().await?;
-        if let Err(e) = self.niri.move_window(window_id, workspace_id).await {
-            // Roll back: it stays parked.
-            let mut state = self.state.lock().await;
-            if let Some(record) = record {
-                state.scratchpad_slots.insert(label.to_string(), record);
-            }
-            return Err(e);
-        }
+        self.niri.move_window(record.id, destination).await?;
 
-        if let Some(record) = &record
-            && record.was_sticky
-        {
+        if record.was_sticky {
             self.state.lock().await.sticky_windows.insert(
-                window_id,
+                record.id,
                 StickyWindow {
                     pin: record.pin.clone(),
                 },
             );
         }
 
-        // A scratchpad floats by default; a remembered size and position win
-        // over the configured ones, so it comes back exactly as it was.
-        let float = scratchpad.is_none_or(|scratchpad| scratchpad.float);
-        if float && let Err(e) = self.niri.float_window(window_id).await {
-            tracing::warn!("Failed to float window {window_id}: {e:#}");
-        }
-
-        let width = remembered_size
-            .map(|(width, _)| Size::Fixed(width))
-            .or_else(|| scratchpad.and_then(|s| s.width).map(to_niri_size));
-        let height = remembered_size
-            .map(|(_, height)| Size::Fixed(height))
-            .or_else(|| scratchpad.and_then(|s| s.height).map(to_niri_size));
-        if (width.is_some() || height.is_some())
-            && let Err(e) = self.niri.resize_window(window_id, width, height).await
-        {
-            tracing::warn!("Failed to size window {window_id}: {e:#}");
-        }
-
-        if let Some((x, y)) = remembered_position {
-            if let Err(e) = self.niri.move_floating_window(window_id, x, y).await {
-                tracing::warn!("Failed to move window {window_id}: {e:#}");
+        if floating {
+            if let Err(e) = self.niri.float_window(record.id).await {
+                tracing::warn!("Failed to float window {}: {e:#}", record.id);
             }
 
-            // niri places floating windows relative to the working area, below
-            // bars and other struts, but reports them in workspace coordinates.
-            // Ask where it landed and correct the difference, so the remembered
-            // position holds whatever struts are in the way.
-            if let Some((actual_x, actual_y)) = self.window_position(window_id).await {
-                let (offset_x, offset_y) = (actual_x - x, actual_y - y);
-                if (offset_x.abs() > 0.5 || offset_y.abs() > 0.5)
-                    && let Err(e) = self
-                        .niri
-                        .move_floating_window(window_id, x - offset_x, y - offset_y)
-                        .await
-                {
-                    tracing::warn!("Failed to place window {window_id}: {e:#}");
+            let width = size.map(|(width, _)| Size::Fixed(width)).or_else(|| {
+                scratchpad
+                    .and_then(|scratchpad| scratchpad.width)
+                    .map(to_niri_size)
+            });
+            let height = size.map(|(_, height)| Size::Fixed(height)).or_else(|| {
+                scratchpad
+                    .and_then(|scratchpad| scratchpad.height)
+                    .map(to_niri_size)
+            });
+            if (width.is_some() || height.is_some())
+                && let Err(e) = self.niri.resize_window(record.id, width, height).await
+            {
+                tracing::warn!("Failed to size window {}: {e:#}", record.id);
+            }
+
+            if let Some((x, y)) = position {
+                if let Err(e) = self.niri.move_floating_window(record.id, x, y).await {
+                    tracing::warn!("Failed to move window {}: {e:#}", record.id);
+                }
+
+                // niri places floating windows relative to the working area,
+                // below bars and other struts, but reports them in workspace
+                // coordinates. Correct the difference so the remembered
+                // position holds whatever struts are in the way.
+                if let Some((actual_x, actual_y)) = self.window_position(record.id).await {
+                    let (offset_x, offset_y) = (actual_x - x, actual_y - y);
+                    if (offset_x.abs() > 0.5 || offset_y.abs() > 0.5)
+                        && let Err(e) = self
+                            .niri
+                            .move_floating_window(record.id, x - offset_x, y - offset_y)
+                            .await
+                    {
+                        tracing::warn!("Failed to place window {}: {e:#}", record.id);
+                    }
                 }
             }
         }
 
-        self.niri.focus_window(window_id).await?;
+        Ok(())
+    }
 
-        // The window is back, so the scratchpad workspace may be empty now.
+    /// Give the scratchpad workspace back once no window is parked on it.
+    async fn release_scratchpad_workspace(&self) {
         let name = self.scratchpad_workspace_name().await;
         self.release_parking_workspace(&name, "the scratchpad window is back")
             .await;
-
-        self.persist().await;
-        Ok(())
     }
 
     /// Workspace id parked windows belong on, creating it if needed.
@@ -1157,7 +1343,9 @@ impl BusinessLogic {
             if name == stage_name {
                 state.staged_windows.is_empty()
             } else {
-                state.scratchpad_slots.is_empty()
+                state.parked_stack.is_empty()
+                    && state.toggled_window.is_none()
+                    && state.scratchpad_slots.is_empty()
             }
         };
         if !empty {
@@ -1281,7 +1469,7 @@ impl BusinessLogic {
         self.niri
             .active_window()
             .await
-            .context("Failed to get active window")
+            .context("No window is focused")
     }
 
     /// Add a window to the sticky list, pinning it according to the
@@ -1937,7 +2125,7 @@ impl BusinessLogic {
     pub async fn handle_window_closed(&self, id: u64) -> Result<()> {
         let _operation = self.operations.lock().await;
         let was_staged = self.is_window_staged(id).await;
-        let was_scratchpad = self.is_scratchpad_window(id).await;
+        let was_scratchpad = self.parked_area(id).await.is_some();
         self.remove_window_unconditionally(id).await?;
 
         if was_staged || was_scratchpad {
@@ -1966,6 +2154,14 @@ impl BusinessLogic {
         state
             .scratchpad_slots
             .retain(|_, window| window.id != window_id);
+        state.parked_stack.retain(|window| window.id != window_id);
+        if state
+            .toggled_window
+            .as_ref()
+            .is_some_and(|window| window.id == window_id)
+        {
+            state.toggled_window = None;
+        }
         Ok(())
     }
 
@@ -1995,8 +2191,8 @@ impl BusinessLogic {
         Ok(marks)
     }
 
-    /// or spawn a command when nothing matches. Ports nirius `focus-or-spawn`
-    /// and spawnjump: one keybinding jumps to the app or starts it.
+    /// Focus a matching window, cycling through matches, or spawn a command
+    /// when nothing matches.
     pub async fn focus_or_spawn(
         &self,
         app_id: Option<&str>,
@@ -2044,10 +2240,8 @@ impl BusinessLogic {
         Ok(format!("Focused {target}"))
     }
 
-    /// Toggle floating on the focused window, remembering its tiled width
-    /// (ports niri_float_helper): floating again restores the width niri
-    /// reports for the tiled window, instead of a stale default. Returns
-    /// whether the window is floating now.
+    /// Float or tile the focused window, remembering the size it had while
+    /// floating. Returns whether the window is floating now.
     pub async fn toggle_floating(&self) -> Result<bool> {
         let window_id = self.active_window_id().await?;
         let windows = self.windows().await?;
@@ -2111,9 +2305,30 @@ impl BusinessLogic {
                     Err(e) => Response::error(e),
                 };
             }
-            Request::Scratchpad { name } => {
-                let name = name.clone();
-                return match self.toggle_scratchpad(name.as_deref()).await {
+            Request::ScratchpadAdd => {
+                return match self.add_scratchpad().await {
+                    Ok(message) => Response::success(message),
+                    Err(e) => Response::error(e),
+                };
+            }
+            Request::ScratchpadRestore { workspace, output } => {
+                return match self
+                    .restore_scratchpad(workspace.as_deref(), output.as_deref())
+                    .await
+                {
+                    Ok(message) => Response::success(message),
+                    Err(e) => Response::error(e),
+                };
+            }
+            Request::ScratchpadToggle {
+                name,
+                workspace,
+                output,
+            } => {
+                return match self
+                    .toggle_scratchpad_to(name.as_deref(), workspace.as_deref(), output.as_deref())
+                    .await
+                {
                     Ok(message) => Response::success(message),
                     Err(e) => Response::error(e),
                 };
@@ -2289,8 +2504,11 @@ impl BusinessLogic {
                 |message| message,
             ),
 
-            Request::Scratchpad { .. } => {
-                unreachable!("Scratchpad is handled by the caller")
+            // Handled by the caller before dispatch, like `Reload`.
+            Request::ScratchpadAdd
+            | Request::ScratchpadRestore { .. }
+            | Request::ScratchpadToggle { .. } => {
+                unreachable!("Scratchpad requests are handled by the caller")
             }
 
             Request::ToggleFloating => reply(self.toggle_floating().await, |floating| {
@@ -2423,7 +2641,7 @@ height = "400"
 
     /// Whether a scratchpad parked this window (a separate area from the stage).
     async fn parked(business: &BusinessLogic, id: u64) -> bool {
-        business.is_scratchpad_window(id).await
+        business.parked_area(id).await.is_some()
     }
 
     async fn sticky(business: &BusinessLogic, id: u64) -> bool {
@@ -3296,7 +3514,7 @@ scratchpad-workspace = "drop"
     }
 
     #[tokio::test]
-    async fn test_scratchpad_shows_a_parked_window_centred_and_sized() {
+    async fn test_a_tiled_scratchpad_window_comes_back_tiled() {
         let niri = with_layout();
         let business = scratchpad_business(&niri).await;
         niri.set_windows(&[(1, "foot", "dropdown-terminal")]);
@@ -3315,17 +3533,167 @@ scratchpad-workspace = "drop"
         assert!(!staged(&business, 1).await);
         assert_eq!(
             niri.window_actions(),
-            vec![
-                "float 1".to_string(),
-                "resize 1 width=60% height=400px".to_string(),
-                "focus 1".to_string(),
-            ],
-            "floated, sized and focused, in that order"
+            vec!["focus 1".to_string()],
+            "it was tiled before, so it is not floated or resized on the way back"
         );
         assert_eq!(
             niri.moves().last().unwrap(),
             &(1, 1),
             "back to the active workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_stack_and_toggle_survive_a_restart() {
+        let niri = with_layout();
+        let storage = Arc::new(MemoryStorage::default());
+        {
+            let business = business_with_storage(&niri, "", &storage);
+            niri.set_active_window(1);
+            business.add_scratchpad().await.unwrap();
+            niri.set_active_window(2);
+            business.toggle_scratchpad(None).await.unwrap();
+        }
+
+        let business = business_with_storage(&niri, "", &storage);
+        business.reconcile().await.unwrap();
+
+        assert!(parked(&business, 1).await, "the stack entry survived");
+        assert!(parked(&business, 2).await, "the toggle slot survived");
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 1"
+        );
+        assert_eq!(
+            business.toggle_scratchpad(None).await.unwrap(),
+            "Shown focused (2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_and_restore_follow_lifo_order() {
+        let niri = with_layout();
+        let business = business(&niri);
+
+        niri.set_active_window(1);
+        assert_eq!(business.add_scratchpad().await.unwrap(), "Parked 1");
+        niri.set_active_window(2);
+        assert_eq!(business.add_scratchpad().await.unwrap(), "Parked 2");
+        assert!(parked(&business, 1).await);
+        assert!(parked(&business, 2).await);
+
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 2",
+            "the most recently parked window comes back first"
+        );
+        assert!(!parked(&business, 2).await);
+        assert!(parked(&business, 1).await);
+
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 1"
+        );
+        let error = business.restore_scratchpad(None, None).await.unwrap_err();
+        assert_eq!(error.to_string(), "Nothing to restore");
+    }
+
+    #[tokio::test]
+    async fn test_add_and_toggle_keep_separate_windows() {
+        let niri = with_layout();
+        let business = business(&niri);
+
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+        niri.set_active_window(2);
+        business.toggle_scratchpad(None).await.unwrap();
+
+        // The toggle key owns window 2 and nothing else.
+        assert_eq!(
+            business.toggle_scratchpad(None).await.unwrap(),
+            "Shown focused (2)"
+        );
+        assert!(!parked(&business, 2).await);
+        assert!(
+            parked(&business, 1).await,
+            "the add stack is untouched by toggle"
+        );
+
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parking_the_same_window_twice_is_a_no_op() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        // The window is on the parking workspace now, so it can gain focus
+        // again; a second `add` must not duplicate it.
+        assert_eq!(
+            business.add_scratchpad().await.unwrap(),
+            "Window 1 is already parked"
+        );
+        assert_eq!(
+            business.restore_scratchpad(None, None).await.unwrap(),
+            "Restored 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_accepts_an_explicit_workspace() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_workspaces(&[
+            (1, "one", "DP-1"),
+            (2, "two", "DP-1"),
+            (3, "stage", "DP-1"),
+            (4, "", "DP-1"),
+        ]);
+        niri.set_active_workspace(1);
+        niri.set_workspace_active(1, true);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        business
+            .restore_scratchpad(Some("two"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            niri.moves().last().unwrap(),
+            &(1, 2),
+            "the window went to the requested workspace by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_the_parking_workspace_picks_an_ordinary_one() {
+        let niri = with_layout();
+        let business = business(&niri);
+        niri.set_active_window(1);
+        business.add_scratchpad().await.unwrap();
+
+        let (parking_id, _) = niri
+            .named_workspaces()
+            .into_iter()
+            .find(|(_, name)| name == "scratchpad")
+            .expect("the scratchpad workspace was created");
+        niri.set_workspace_focused(parking_id);
+        niri.set_active_workspace(parking_id);
+        niri.set_active_window(1);
+
+        business.restore_scratchpad(None, None).await.unwrap();
+
+        let (window, destination) = *niri.moves().last().unwrap();
+        assert_eq!(window, 1);
+        assert_ne!(
+            destination, parking_id,
+            "a window restored while focus is on the parking area must not go back there"
         );
     }
 
@@ -3403,15 +3771,17 @@ scratchpad-workspace = "drop"
         business.unstage_window(1, 1).await.unwrap();
         let actions = niri.window_actions();
         assert!(
-            actions.contains(&"float 1".to_string()),
+            actions.iter().any(|i| i == "float 1"),
             "a staged PiP window is floated on return: {actions:?}"
         );
         assert!(
-            actions.contains(&"resize 1 width=480px height=270px".to_string()),
+            actions
+                .iter()
+                .any(|i| i == "resize 1 width=480px height=270px"),
             "a staged PiP window comes back at its size: {actions:?}"
         );
         assert!(
-            actions.contains(&"move 1 1400 750".to_string()),
+            actions.iter().any(|i| i == "move 1 1400 750"),
             "a staged PiP window comes back at its position: {actions:?}"
         );
     }
@@ -3439,15 +3809,17 @@ scratchpad-workspace = "drop"
         business.unstage_window(2, 1).await.unwrap();
         let actions = niri.window_actions();
         assert!(
-            actions.contains(&"float 2".to_string()),
+            actions.iter().any(|i| i == "float 2"),
             "unstaged tiled window of a remembered app is floated: {actions:?}"
         );
         assert!(
-            actions.contains(&"resize 2 width=640px height=360px".to_string()),
+            actions
+                .iter()
+                .any(|i| i == "resize 2 width=640px height=360px"),
             "same app, no own geometry: falls back to the remembered one: {actions:?}"
         );
         assert!(
-            actions.contains(&"move 2 100 100".to_string()),
+            actions.iter().any(|i| i == "move 2 100 100"),
             "remembered position is restored too: {actions:?}"
         );
     }
@@ -3539,7 +3911,7 @@ scratchpad-workspace = "drop"
 
         assert!(business.toggle_floating().await.unwrap());
         let actions = niri.window_actions();
-        assert!(actions.contains(&"float 1".to_string()));
+        assert!(actions.iter().any(|i| i == "float 1"));
     }
 
     #[tokio::test]
@@ -3599,11 +3971,13 @@ scratchpad-workspace = "drop"
 
         let actions = niri.window_actions();
         assert!(
-            actions.contains(&"resize 2 width=480px height=270px".to_string()),
+            actions
+                .iter()
+                .any(|i| i == "resize 2 width=480px height=270px"),
             "the reopened window gets the remembered size: {actions:?}"
         );
         assert!(
-            actions.contains(&"move 2 1400 750".to_string()),
+            actions.iter().any(|i| i == "move 2 1400 750"),
             "and the remembered position: {actions:?}"
         );
     }
@@ -3689,11 +4063,13 @@ scratchpad-workspace = "drop"
 
         let actions = niri.window_actions();
         assert!(
-            actions.contains(&"resize 1 width=1100px height=480px".to_string()),
+            actions
+                .iter()
+                .any(|i| i == "resize 1 width=1100px height=480px"),
             "the remembered size is applied: {actions:?}"
         );
         assert!(
-            actions.contains(&"move 1 730 94".to_string()),
+            actions.iter().any(|i| i == "move 1 730 94"),
             "the remembered position is applied: {actions:?}"
         );
     }
@@ -3739,8 +4115,8 @@ float = true
         assert!(!parked(&business, 2).await);
         assert_eq!(
             niri.window_actions(),
-            vec!["float 2".to_string(), "focus 2".to_string(),],
-            "no geometry was configured or remembered, so nothing is resized"
+            vec!["focus 2".to_string()],
+            "a tiled window came back tiled, so nothing is floated or resized"
         );
     }
 
@@ -3775,8 +4151,10 @@ app-id = "foot"
         let business = scratchpad_business(&niri).await;
 
         match business
-            .handle_request(Request::Scratchpad {
+            .handle_request(Request::ScratchpadToggle {
                 name: Some("term".to_string()),
+                workspace: None,
+                output: None,
             })
             .await
         {
@@ -3811,8 +4189,10 @@ app-id = "foot"
             business.reconcile().await.unwrap();
             business.toggle_scratchpad(Some("term")).await.unwrap();
             business
-                .handle_request(Request::Scratchpad {
+                .handle_request(Request::ScratchpadToggle {
                     name: Some("term".to_string()),
+                    workspace: None,
+                    output: None,
                 })
                 .await;
         })
@@ -4704,8 +5084,10 @@ floating = true
         let business = business(&niri);
 
         match business
-            .handle_request(Request::Scratchpad {
+            .handle_request(Request::ScratchpadToggle {
                 name: Some("term".to_string()),
+                workspace: None,
+                output: None,
             })
             .await
         {
@@ -4728,8 +5110,10 @@ floating = true
 
         niri.fail_move(1);
         let response = business
-            .handle_request(Request::Scratchpad {
+            .handle_request(Request::ScratchpadToggle {
                 name: Some("term".to_string()),
+                workspace: None,
+                output: None,
             })
             .await;
 
@@ -4756,8 +5140,10 @@ floating = true
         let business = business_with_storage(&niri, SCRATCHPAD_CONFIG, &storage);
         niri.set_windows(&[(1, "foot", "dropdown-terminal")]);
         business
-            .handle_request(Request::Scratchpad {
+            .handle_request(Request::ScratchpadToggle {
                 name: Some("term".to_string()),
+                workspace: None,
+                output: None,
             })
             .await;
         let parked_state = storage.snapshot().unwrap();
@@ -4765,8 +5151,10 @@ floating = true
 
         niri.fail_move(1);
         let response = business
-            .handle_request(Request::Scratchpad {
+            .handle_request(Request::ScratchpadToggle {
                 name: Some("term".to_string()),
+                workspace: None,
+                output: None,
             })
             .await;
 
@@ -5545,7 +5933,7 @@ app-id = "foot"
         niri.fail_next(Call::ActiveWindow);
         match business.handle_request(Request::StageToggleActive).await {
             Response::Error { message } => {
-                assert!(message.contains("Failed to get active window"), "{message}")
+                assert!(message.contains("No window is focused"), "{message}")
             }
             other => panic!("expected an error, got {other:?}"),
         }

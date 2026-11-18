@@ -389,14 +389,14 @@ run nsticky reload
 : >"$WORK/requests.log"
 
 # No matching window yet: it starts the configured command.
-run nsticky scratchpad term
+run nsticky scratchpad toggle term
 check_contains "starts the command when nothing is open" "Starting term" "$OUT"
 check_contains "the command reaches the compositor" "SPAWN foot --app-id foot --title dropdown-terminal" "$(cat "$WORK/requests.log")"
 
 # Now the window exists and is visible: the toggle parks it.
 write_scratchpad_window
 : >"$WORK/requests.log"
-run nsticky scratchpad term
+run nsticky scratchpad toggle term
 check_contains "a visible scratchpad is hidden" "Hidden term" "$OUT"
 
 # It gets its own workspace, separate from the stage: a dropdown terminal must
@@ -419,7 +419,7 @@ check_contains "a scratchpad window is not a staged window" "[]" "$OUT"
 
 # And back: shown, floated, sized and focused, in one call.
 : >"$WORK/requests.log"
-run nsticky scratchpad term
+run nsticky scratchpad toggle term
 check_contains "a parked scratchpad is shown" "Shown term" "$OUT"
 check_contains "it comes back floating" "FLOAT 1" "$(cat "$WORK/requests.log")"
 check_contains "it keeps the size it had" "WIDTH 1 {\"SetFixed\": 1100}" "$(cat "$WORK/requests.log")"
@@ -432,10 +432,19 @@ check_contains "the empty scratchpad workspace is released" "UNNAME $PAD" "$(cat
 write_config_plain
 run nsticky reload
 : >"$WORK/requests.log"
-run nsticky scratchpad
+run nsticky scratchpad toggle
 check_contains "no name toggles the focused window (hide)" "Hidden focused" "$OUT"
-run nsticky scratchpad
+run nsticky scratchpad toggle
 check_contains "no name toggles the focused window (show)" "Shown focused" "$OUT"
+
+# add/restore use their own LIFO stack, separate from the toggle slot.
+run nsticky scratchpad add
+check_contains "add parks the focused window" "Parked" "$OUT"
+run nsticky scratchpad restore
+check_contains "restore brings it back" "Restored" "$OUT"
+run nsticky scratchpad restore
+check_status "an empty restore exits non-zero" 1 "$STATUS"
+check_contains "an empty restore says so" "Nothing to restore" "$(echo "$OUT" | tail -1)"
 
 echo "== parking areas stay at the end =="
 # One window parked on each area, with the user's own workspaces above them.
@@ -449,7 +458,7 @@ cat >"$WORK/windows.json" <<'JSON'
 ]
 JSON
 start_daemon
-run nsticky scratchpad term   # parks window 1 on the scratchpad workspace
+run nsticky scratchpad toggle term   # parks window 1 on the scratchpad workspace
 run nsticky stage add 2       # parks window 2 on the stage workspace
 
 # Both areas end up below every workspace the user works on, in a fixed order:

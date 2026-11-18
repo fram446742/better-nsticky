@@ -60,21 +60,32 @@ pub enum Request {
     Windows,
     /// Re-read `config.toml` and apply it without restarting the daemon.
     Reload,
-    /// Toggle a scratchpad: hide it, show it, or start it. Without a name it
-    /// toggles the focused window.
-    Scratchpad {
-        name: Option<String>,
+    /// Park the focused window on the scratchpad stack.
+    ScratchpadAdd,
+    /// Bring back the most recently parked window.
+    ScratchpadRestore {
+        /// Workspace id or name. Defaults to the focused workspace.
+        workspace: Option<String>,
+        /// Output name. Defaults to the focused output.
+        output: Option<String>,
     },
-    /// Focus a matching window (cycling through matches), or spawn a command
-    /// when nothing matches. Ports the nirius `focus-or-spawn` / spawnjump
-    /// pattern: one keybinding that jumps to the app or starts it.
+    /// Hide the focused window, or bring back the window this slot owns.
+    ScratchpadToggle {
+        /// Configured scratchpad, instead of the unnamed toggle slot.
+        name: Option<String>,
+        /// Workspace id or name for showing a parked window.
+        workspace: Option<String>,
+        /// Output name for showing a parked window.
+        output: Option<String>,
+    },
+    /// Focus a matching window, cycling through matches, or spawn a command
+    /// when nothing matches.
     FocusOrSpawn {
         app_id: Option<String>,
         title: Option<String>,
         spawn: Vec<String>,
     },
-    /// Tag a window with a short label, nirius `toggle-mark` port: sticky-lite
-    /// for windows that need a name without a config rule.
+    /// Label a window.
     Mark {
         window_id: u64,
         mark: String,
@@ -83,10 +94,10 @@ pub enum Request {
     Unmark {
         window_id: u64,
     },
-    /// List every marked window (`mark -> id` pairs as JSON).
+    /// Every label and its window id, as JSON.
     ListMarks,
-    /// Toggle floating on the focused window, remembering its tiled width
-    /// (ports niri_float_helper): floating again restores where it was.
+    /// Float a tiled window or tile a floating one, remembering the floating
+    /// size so it comes back.
     ToggleFloating,
 }
 

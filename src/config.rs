@@ -187,16 +187,15 @@ impl Size {
     }
 }
 
-/// A window that toggles between parked and shown on top: the "dropdown
-/// terminal" pattern, without a shell script.
+/// A window bound to one key, usually a dropdown terminal.
 #[derive(Debug, Clone)]
 pub struct Scratchpad {
     pub name: String,
-    /// Matching fields, exactly like a rule; `None` means focus-tracking.
+    /// Matching fields, like a rule; `None` follows focus.
     matcher: Option<CompiledRule>,
     /// Command started when no matching window exists.
     pub spawn: Option<Vec<String>>,
-    /// Whether showing it should float it.
+    /// Float the window when there is no remembered state.
     pub float: bool,
     pub width: Option<Size>,
     pub height: Option<Size>,

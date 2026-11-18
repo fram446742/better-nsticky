@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::{
@@ -13,107 +13,134 @@ use crate::niri::WindowInfo;
 use crate::protocol;
 
 #[derive(Parser, Debug)]
-#[command(name = "nsticky")]
-#[command(version)]
-#[command(about = "Manage sticky windows via CLI", long_about = None)]
+#[command(
+    name = "nsticky",
+    version,
+    about = "Park windows in niri and bring them back with one key",
+    long_about = "Keep windows out of the way without closing them.\n\n\
+        sticky windows follow you across workspaces, the stage parks any number \
+        of windows behind a picker, and a scratchpad toggles one window from a \
+        keybinding.",
+    after_help = "EXAMPLES:\n  \
+nsticky sticky toggle-active        keep the focused window on every workspace\n  \
+nsticky stage add 42                park window 42 on the stage workspace\n  \
+nsticky stage restore               pick a staged window and bring it back\n  \
+nsticky scratchpad add              park the focused window\n  \
+nsticky scratchpad restore          bring back the most recently parked window\n  \
+nsticky scratchpad toggle           hide the focused window; press again to show it\n  \
+nsticky scratchpad toggle term      toggle the [scratchpad.term] window\n\n\
+`nsticky completions <shell>` prints a completion script for bash, zsh, fish or elvish."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Print machine-readable JSON instead of a table (list commands).
+    /// Print JSON instead of a table for list commands.
     #[arg(long, global = true)]
     json: bool,
 }
 
-/// Manage sticky windows across all workspaces.
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Keep windows on every workspace.
     Sticky {
         #[command(subcommand)]
         action: StickyAction,
     },
-    /// Manage staged windows (temporarily hidden in stage workspace).
+    /// Park any number of windows and restore them from a picker.
     Stage {
         #[command(subcommand)]
         action: StageAction,
     },
-    /// Report what nsticky can see: daemon, niri, paths and counts.
-    Status,
-    /// Re-read config.toml and apply it without restarting the daemon.
-    Reload,
-    /// Toggle a scratchpad from `[scratchpad.<name>]`: hide it, show it, or
-    /// start it if it is not running. Without a name, toggles the focused
-    /// window.
+    /// Hide one window and summon it with the same command.
     Scratchpad {
-        /// Scratchpad to toggle; omitted means the focused window.
-        name: Option<String>,
+        #[command(subcommand)]
+        action: ScratchpadAction,
     },
+    /// Show the daemon, the niri connection, paths and counts.
+    Status,
+    /// Re-read config.toml without restarting the daemon.
+    Reload,
     /// Inspect the configuration.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// List open windows with optional filters.
+    /// List open windows.
     Windows {
-        /// Filter by application ID (partial match).
+        /// Only windows whose app id contains this text.
         #[arg(long)]
         app_id: Option<String>,
-        /// Filter by window title (partial match).
+        /// Only windows whose title contains this text.
         #[arg(long)]
         title: Option<String>,
     },
-    /// Focus a matching window (cycling through matches), or spawn a command
-    /// when nothing matches. One keybinding jumps to the app or starts it
-    /// (ports nirius `focus-or-spawn` / spawnjump).
+    /// Jump to a matching window, or start it when none matches.
     Focus {
-        /// Match by application ID (substring).
+        /// Match windows whose app id contains this text.
         #[arg(long)]
         app_id: Option<String>,
-        /// Match by window title (substring).
+        /// Match windows whose title contains this text.
         #[arg(long)]
         title: Option<String>,
         /// Command to run when nothing matches.
         #[arg(last = true)]
         spawn: Vec<String>,
     },
-    /// Tag a window with a short label (nirius `toggle-mark` port without the
-    /// toggle: memory only, gone on restart; listed by `marks`).
+    /// Label a window (in memory; lost when the daemon restarts).
     Mark {
-        /// Window to label.
+        /// Window id, as shown by `nsticky windows`.
         window_id: u64,
-        /// Label for the window.
+        /// Text to attach; replaces an existing label.
         mark: String,
     },
     /// Remove a window's label.
     Unmark {
-        /// Window to unlabel.
+        /// Window id, as shown by `nsticky windows`.
         window_id: u64,
     },
-    /// List every marked window.
+    /// List labelled windows.
     Marks,
-    /// Toggle floating on the focused window (ports niri_float_helper).
+    /// Toggle floating on the focused window.
     ToggleFloating,
+    /// Print a shell completion script.
+    Completions {
+        /// Shell the script is for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
-/// Actions for sticky windows.
 #[derive(Subcommand, Debug)]
 enum StickyAction {
-    /// Add a window to sticky list by window ID.
+    /// Make a window sticky.
     #[command(alias = "a")]
-    Add { window_id: u64 },
-    /// Remove a window from sticky list by window ID.
+    Add {
+        /// Window id, as shown by `nsticky windows`.
+        window_id: u64,
+    },
+    /// Stop keeping a window sticky.
     #[command(alias = "r")]
-    Remove { window_id: u64 },
-    /// List all sticky windows.
+    Remove {
+        /// Window id, as shown by `nsticky windows`.
+        window_id: u64,
+    },
+    /// List sticky windows.
     #[command(alias = "l")]
     List,
-    /// Toggle sticky state of the currently active window.
+    /// Toggle sticky on the focused window.
     #[command(alias = "t")]
     ToggleActive,
-    /// Toggle sticky state of windows matching the given app ID.
+    /// Toggle sticky on every window with this app id.
     #[command(alias = "ta")]
-    ToggleAppid { appid: String },
-    /// Toggle sticky state of windows matching the given title.
+    ToggleAppid {
+        /// Exact app id, e.g. `firefox`.
+        appid: String,
+    },
+    /// Toggle sticky on every window with this title.
     #[command(alias = "tt")]
-    ToggleTitle { title: String },
+    ToggleTitle {
+        /// Exact window title.
+        title: String,
+    },
 }
 
 /// Actions for the configuration.
@@ -123,36 +150,77 @@ enum ConfigAction {
     Check,
 }
 
-/// Actions for staged windows.
 #[derive(Subcommand, Debug)]
 enum StageAction {
-    /// List all staged windows.
+    /// List staged windows.
     #[command(alias = "l")]
     List,
-    /// Stage a window by ID (move to stage workspace).
+    /// Park a window on the stage workspace.
     #[command(alias = "a")]
-    Add { window_id: u64 },
-    /// Unstage a window by ID (move back from stage workspace).
+    Add {
+        /// Window id, as shown by `nsticky windows`.
+        window_id: u64,
+    },
+    /// Bring a staged window back to the focused workspace.
     #[command(alias = "r")]
-    Remove { window_id: u64 },
-    /// Toggle stage state of the currently active window.
+    Remove {
+        /// Window id, as shown by `nsticky windows`.
+        window_id: u64,
+    },
+    /// Stage or unstage the focused window.
     #[command(alias = "t")]
     ToggleActive,
-    /// Toggle stage state of windows matching the given app ID.
+    /// Stage or unstage every window with this app id.
     #[command(alias = "ta")]
-    ToggleAppid { appid: String },
-    /// Toggle stage state of windows matching the given title.
+    ToggleAppid {
+        /// Exact app id, e.g. `firefox`.
+        appid: String,
+    },
+    /// Stage or unstage every window with this title.
     #[command(alias = "tt")]
-    ToggleTitle { title: String },
-    /// Stage all sticky windows.
+    ToggleTitle {
+        /// Exact window title.
+        title: String,
+    },
+    /// Stage every sticky window.
     #[command(alias = "aa")]
     AddAll,
-    /// Unstage all staged windows.
+    /// Bring back every staged window.
     #[command(alias = "ra")]
     RemoveAll,
-    /// Interactive restore: list staged windows with names and pick one to unstage.
+    /// Pick a staged window from a menu and bring it back.
     #[command(alias = "rs")]
     Restore,
+}
+
+/// The three ways a scratchpad holds a window.
+#[derive(Subcommand, Debug)]
+enum ScratchpadAction {
+    /// Park the focused window; `restore` brings it back (LIFO).
+    #[command(alias = "a")]
+    Add,
+    /// Bring back the most recently parked window.
+    #[command(alias = "r")]
+    Restore {
+        /// Workspace id or name; defaults to the focused workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Output name, e.g. `DP-1`; defaults to the focused output.
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Hide the focused window; the same command shows it again.
+    #[command(alias = "t")]
+    Toggle {
+        /// Configured `[scratchpad.<name>]` to toggle instead of the focused window.
+        name: Option<String>,
+        /// Workspace id or name; defaults to the focused workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Output name, e.g. `DP-1`; defaults to the focused output.
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
 impl Cli {
@@ -179,8 +247,23 @@ impl Cli {
             },
             Commands::Status => unreachable!("Status is handled separately"),
             Commands::Reload => protocol::Request::Reload,
-            Commands::Scratchpad { name } => protocol::Request::Scratchpad { name },
+            Commands::Scratchpad { action } => match action {
+                ScratchpadAction::Add => protocol::Request::ScratchpadAdd,
+                ScratchpadAction::Restore { workspace, output } => {
+                    protocol::Request::ScratchpadRestore { workspace, output }
+                }
+                ScratchpadAction::Toggle {
+                    name,
+                    workspace,
+                    output,
+                } => protocol::Request::ScratchpadToggle {
+                    name,
+                    workspace,
+                    output,
+                },
+            },
             Commands::Config { .. } => unreachable!("Config is handled separately"),
+            Commands::Completions { .. } => unreachable!("Completions are handled separately"),
             Commands::Windows { .. } => protocol::Request::Windows,
             Commands::Focus {
                 app_id,
@@ -731,6 +814,11 @@ async fn dispatch(
             action: ConfigAction::Check,
         } => return run_config_check(endpoints, cli.json, out),
         Commands::Status => return run_status(endpoints, out).await,
+        Commands::Completions { shell } => {
+            let mut command = Cli::command();
+            clap_complete::generate(*shell, &mut command, "nsticky", out);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -739,6 +827,9 @@ async fn dispatch(
         _ => (None, None),
     };
 
+    // A keybinding has no terminal: tell the user when the scratchpad had
+    // nothing to act on, but never make the notification itself an error.
+    let notify = matches!(&cli.command, Commands::Scratchpad { .. });
     let view = data_view(&cli.command);
     let json = cli.json;
     let request = cli.into_request();
@@ -749,11 +840,26 @@ async fn dispatch(
             Ok(())
         }
         // A failed command must not exit 0: scripts and keybindings rely on it.
-        protocol::Response::Error { message } => bail!("{message}"),
+        protocol::Response::Error { message } => {
+            if notify {
+                notify_user(&message);
+            }
+            bail!("{message}")
+        }
         protocol::Response::Data { data } => {
             render_data(endpoints, view, &data, json, &filter_args, out).await
         }
     }
+}
+
+/// Best-effort desktop notification for a command run from a keybinding.
+fn notify_user(message: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "nsticky", "-u", "low", "-t", "3000", "nsticky"])
+        .arg(message)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// How a `Data` response should be presented.
@@ -1343,20 +1449,56 @@ exclude-app-id = "steamwebhelper"
     }
 
     #[test]
-    fn test_cli_scratchpad() {
-        let cli = Cli::try_parse_from(["nsticky", "scratchpad", "term"]).unwrap();
+    fn test_cli_scratchpad_verbs() {
+        let cli = Cli::try_parse_from(["nsticky", "scratchpad", "add"]).unwrap();
+        assert_eq!(cli.into_request(), protocol::Request::ScratchpadAdd);
+
+        let cli = Cli::try_parse_from(["nsticky", "scratchpad", "restore"]).unwrap();
         assert_eq!(
             cli.into_request(),
-            protocol::Request::Scratchpad {
-                name: Some("term".to_string())
+            protocol::Request::ScratchpadRestore {
+                workspace: None,
+                output: None,
             }
         );
 
-        let cli = Cli::try_parse_from(["nsticky", "scratchpad"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "nsticky",
+            "scratchpad",
+            "restore",
+            "--workspace",
+            "dev",
+            "--output",
+            "DP-2",
+        ])
+        .unwrap();
         assert_eq!(
             cli.into_request(),
-            protocol::Request::Scratchpad { name: None },
+            protocol::Request::ScratchpadRestore {
+                workspace: Some("dev".to_string()),
+                output: Some("DP-2".to_string()),
+            }
+        );
+
+        let cli = Cli::try_parse_from(["nsticky", "scratchpad", "toggle"]).unwrap();
+        assert_eq!(
+            cli.into_request(),
+            protocol::Request::ScratchpadToggle {
+                name: None,
+                workspace: None,
+                output: None,
+            },
             "no name toggles the focused window"
+        );
+
+        let cli = Cli::try_parse_from(["nsticky", "scratchpad", "toggle", "term"]).unwrap();
+        assert_eq!(
+            cli.into_request(),
+            protocol::Request::ScratchpadToggle {
+                name: Some("term".to_string()),
+                workspace: None,
+                output: None,
+            }
         );
     }
 
@@ -2084,7 +2226,7 @@ exclude-app-id = "steamwebhelper"
             vec!["nsticky", "reload", "--json"],
             vec!["nsticky", "config", "check", "--json"],
             vec!["nsticky", "stage", "restore", "--json"],
-            vec!["nsticky", "scratchpad", "--json"],
+            vec!["nsticky", "scratchpad", "add", "--json"],
             vec!["nsticky", "sticky", "add", "1", "--json"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();

@@ -35,9 +35,9 @@ windows itself.
 | Window labels | — | `nsticky mark <id> <label>` / `unmark` / `marks`: memory-only tags, cleared with the window and on restart |
 | Find or start | — | `nsticky focus --app-id X -- cmd`: focus the next match (repeats cycle), or spawn when nothing matches |
 | Stage restore | menu of ids | urgent windows listed first (marked `‼`), then the rest |
-| Scratchpads | — | `[scratchpad.<name>]` + one keybinding: hide/show/spawn a dropdown, floating and sized |
+| Scratchpads | — | `scratchpad add` / `restore` (LIFO) and `toggle`: park, retrieve, or hide/show one window from a keybinding |
 | Matching | app id + title | also `floating = true/false`, rule reload (`nsticky reload`, `SIGHUP`, niri's own reload) |
-| CLI | — | `config check`, tables + `--json`, non-zero exits on failure |
+| CLI | — | `config check`, tables + `--json`, shell completions, non-zero exits on failure |
 | Daemon | — | operation lock, single instance, socket `0600`, bounded requests, one IPC connection |
 | Compositor restart | event stream ends for good | reconnects with a capped backoff (1s→30s), CLI keeps working meanwhile |
 | Overview | — | the parking areas are not reordered while niri's overview is open, only once it closes |
@@ -220,7 +220,7 @@ spawn = ["env", "DROPDOWN_TERM=1", "foot", "--app-id", "foot", "--title", "dropd
 ```
 
 ```kdl
-Mod+Shift+Return { spawn "nsticky" "scratchpad" "term"; }
+Mod+Shift+Return { spawn "nsticky" "scratchpad" "toggle" "term"; }
 ```
 
 ### Matching rules
@@ -331,62 +331,61 @@ non-zero status, the exit status is reported and the windows are left staged.
 ### Scratchpads
 
 `stage` parks any number of windows and `stage restore` brings them back through
-the selector. A scratchpad is the other half: one window that goes away and comes
-back with the same key, no selector involved.
+the selector. A scratchpad is for the window you want back on one key.
+
+There are three verbs. All of them act on the focused window unless a name is
+given:
+
+| Command | What it does |
+| --- | --- |
+| `nsticky scratchpad add` | parks the focused window on a LIFO stack |
+| `nsticky scratchpad restore` | brings back the most recently parked window |
+| `nsticky scratchpad toggle [name]` | parks the focused window in a toggle slot; the same command shows it again |
+
+`add` and `restore` are a stack: two `add`s need two `restore`s, newest first.
+`toggle` owns one window, so after hiding it the next `toggle` brings it back even
+if focus moved elsewhere. The two areas never mix.
+
+A restored window returns to the focused workspace by default. `--workspace` and
+`--output` place it somewhere else:
+
+```bash
+nsticky scratchpad restore --workspace dev --output DP-2
+```
+
+niri has no hidden workspaces, so a parked window waits on a normal workspace at
+the end of the strip. If focus is on that workspace, the window goes to the
+nearest ordinary workspace instead of back where it was parked.
+
+`add` and `toggle` remember whether the window was tiled or floating, its size and
+position, and whether it was sticky or staged. A tiled window comes back tiled; a
+floating one comes back at the same size and place.
+
+#### Configured scratchpads
+
+A `[scratchpad.<name>]` section adds a matcher and a command to start:
 
 ```toml
 [scratchpad.term]
 app-id = "dropdown-terminal"     # matching fields, exactly like a rule
 spawn = ["env", "DROPDOWN_TERM=1", "foot", "--app-id", "dropdown-terminal", "--title", "dropdown-terminal"]
-float = true                     # default
+float = true                     # only used when there is nothing to remember
 ```
 
 ```kdl
-Mod+Shift+Return { spawn "nsticky" "scratchpad" "term"; }
+Mod+Shift+Return { spawn "nsticky" "scratchpad" "toggle" "term"; }
 ```
 
-One press does one of three things:
+A named `toggle` works like the unnamed one: the first press parks the matching
+window (or the focused one when the section has no matcher), the second shows it
+again, and when nothing matches the `spawn` command starts it. `width`/`height`
+and `float` are fallbacks for a window with no remembered state; leave them out
+and niri's own `window-rule` decides how it opens. Sizes are pixels (`"800"`) or a
+percentage (`"60%"` is 60%, not 0.6).
 
-- a matching window is visible (or staged by hand): park it on its own workspace,
-  remembering where it was and how big it was;
-- the window it parked before is still parked: bring it back to the focused
-  workspace, floating and focused, at that remembered size and position;
-- nothing matches and `spawn` is set: start it.
-
-Its own workspace is what keeps the two areas apart: `stage restore` never brings
-back a scratchpad window, and the scratchpad workspace comes and goes with the
-window it holds.
-
-The remembered geometry is what makes it come back where it was. `width`/`height`
-are only a fallback the first time, when there is nothing to remember; leave them
-out and niri's own `window-rule` decides how the window opens. Sizes are pixels
-(`"800"`) or a percentage (`"60%"` is 60%, not 0.6).
-
-#### Toggling whatever is focused
-
-Without matching fields, or without a name at all, the scratchpad works on the
-focused window instead of a configured one. No configuration is needed:
-
-```bash
-nsticky scratchpad            # take the focused window away, press again to get it back
-```
-
-A named section with no matching fields still carries the options (`float`,
-size):
-
-```toml
-[scratchpad.focus]
-float = true
-```
-
-```kdl
-Mod+Alt+S { spawn "nsticky" "scratchpad" "focus"; }
-```
-
-The key never names a window: the scratchpad keeps the window it parked in its
-state, so the second press brings that same window back even if focus moved on.
-Restoring the window another way (a `stage restore`, or closing it) clears the
-slot. The slot is persisted, so it survives a daemon or session restart.
+When there is nothing to park, restore or show, the CLI exits with an error, and
+also sends a desktop notification if `notify-send` is installed, so a keybinding
+never fails silently.
 
 #### Opening floating and positioned
 
@@ -692,12 +691,26 @@ nsticky stage restore
 staged window back. `restore` pipes the staged windows to the configured
 selector and brings back the ones you pick, more than one if you want.
 
+#### Scratchpads
+
+```bash
+nsticky scratchpad add                  # park the focused window (LIFO stack)
+nsticky scratchpad restore              # bring back the most recently parked window
+nsticky scratchpad restore --workspace dev --output DP-2
+nsticky scratchpad toggle               # hide the focused window; press again to show it
+nsticky scratchpad toggle term          # same, for [scratchpad.term]
+```
+
+`add`/`restore` and `toggle` keep separate windows. `restore` and `toggle` take
+`--workspace` (id or name) and `--output`; without them the window returns to the
+focused workspace. A tiled window comes back tiled, a floating one at its old
+size and position.
+
 #### Everything else
 
 ```bash
 nsticky status                          # daemon, niri, paths and window counts (non-zero exit when the daemon is down)
 nsticky reload                          # re-read config.toml without restarting the daemon
-nsticky scratchpad [name]               # toggle a scratchpad: hide, show, or start it (no name: the focused window)
 nsticky focus [--app-id ID] [--title T] [-- command...]  # focus a match (cycling), or spawn when nothing matches
 nsticky mark <window_id> <label>         # tag a window (memory only, gone on restart)
 nsticky unmark <window_id>               # remove a window's label
@@ -723,6 +736,17 @@ nsticky config check --json             # resolved paths, stage workspace, follo
 
 `--json` is a global flag. Anything that fails (no daemon, unknown window, broken
 config) exits non-zero and prints the reason on stderr.
+
+#### Shell completions
+
+`nsticky completions <shell>` writes a completion script generated from the same
+clap definitions as `--help`:
+
+```bash
+nsticky completions fish > ~/.config/fish/completions/nsticky.fish
+nsticky completions zsh  > ~/.zfunc/_nsticky
+nsticky completions bash > ~/.local/share/bash-completion/completions/nsticky
+```
 
 #### Configuration check
 
