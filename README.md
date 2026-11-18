@@ -30,10 +30,17 @@ windows itself.
 | State | in memory only | persisted, reconciled with the compositor on start |
 | Menu | `split_whitespace()` | shell-style quoting, array form, [Vicinae](https://www.vicinae.com/) discovery, never a shell |
 | Monitors | sticky windows follow every activation | per-rule `output` pins, `sticky-follow = "own-output"`, activations that did not take focus are ignored |
+| Follow policy | follow focus only | `sticky-follow = "focused"` / `"own-output"` / `"on-hide"` (nirius `if-invisible`: stay visible, follow only once hidden) |
+| Floating memory | — | `nsticky toggle-floating`; floating geometry remembered per app **and** output, so a PiP window comes back where it was |
+| Window labels | — | `nsticky mark <id> <label>` / `unmark` / `marks`: memory-only tags, cleared with the window and on restart |
+| Find or start | — | `nsticky focus --app-id X -- cmd`: focus the next match (repeats cycle), or spawn when nothing matches |
+| Stage restore | menu of ids | urgent windows listed first (marked `‼`), then the rest |
 | Scratchpads | — | `[scratchpad.<name>]` + one keybinding: hide/show/spawn a dropdown, floating and sized |
 | Matching | app id + title | also `floating = true/false`, rule reload (`nsticky reload`, `SIGHUP`, niri's own reload) |
 | CLI | — | `config check`, tables + `--json`, non-zero exits on failure |
 | Daemon | — | operation lock, single instance, socket `0600`, bounded requests, one IPC connection |
+| Compositor restart | event stream ends for good | reconnects with a capped backoff (1s→30s), CLI keeps working meanwhile |
+| Overview | — | the parking areas are not reordered while niri's overview is open, only once it closes |
 
 ## Installation
 
@@ -68,22 +75,6 @@ cargo install --git https://github.com/fram446742/better-nsticky --locked
 
 `--locked` keeps the dependency versions from `Cargo.lock`, so you build what the
 tests were run against.
-
-### Arch / CachyOS
-
-[`packaging/PKGBUILD`](packaging/PKGBUILD) builds a real package (and runs the
-test suite as its `check()`):
-
-```bash
-packaging/make-pkg.sh          # build better-nsticky-<version>-<rel>-x86_64.pkg.tar.zst
-packaging/make-pkg.sh -si      # build and install it (sudo)
-```
-
-The package is named `better-nsticky`, `provides`/`conflicts` with `nsticky`, and
-installs `/usr/bin/nsticky`. It depends on `cargo` for building only. Once the
-repository is pushed and tagged, the same PKGBUILD works for the AUR — swap the
-`source` line for the tagged tarball as the comment in the file explains, then
-run `updpkgsums`.
 
 ### Nix
 
